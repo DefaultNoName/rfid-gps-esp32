@@ -9,21 +9,22 @@
 #include <map>
 
 // WiFi configuration
-IPAddress AP_IP = IPAddress(192, 168, 120, 1);
-IPAddress AP_GW = IPAddress(192, 168, 120, 1);
-IPAddress AP_SN = IPAddress(255, 255, 255, 0);
-#define AP_SSID "ESP32_AP"
-#define AP_PASSWORD "01234567890"
-#define AP_CHANNEL 6
-#define AP_MAX_CONNECTIONS 8
-#define MAX_WS_CLIENTS 8
-#define MAX_SSE_CLIENTS 8
+IPAddress AP_IP = IPAddress(192, 168, 120, 1); // IP Address
+IPAddress AP_GW = IPAddress(192, 168, 120, 1); // Gateway
+IPAddress AP_SN = IPAddress(255, 255, 255, 0); // Mask
+#define AP_SSID "ESP32_AP"                     // SSID
+#define AP_PASSWORD "01234567890"              // Password
+#define AP_CHANNEL 6                           // Channel
+#define AP_MAX_CONNECTIONS 8                   // AP Clients
+#define MAX_WS_CLIENTS 8                       // WebSocket clients
+#define MAX_SSE_CLIENTS 8                      // SSE clients
+#define MAX_ESP32_CLIENTS 10                   // Maximum number of ESP32 sensor nodes
 
 // Server configuration
 PsychicHttpServer server;
 const unsigned int serverPort = 80;
-const unsigned int maxURI = 30;
-const unsigned int maxSockets = 16;
+const unsigned int maxURI = 20;
+const unsigned int maxSockets = 12;
 const unsigned int lingerTimeout = 3;
 const unsigned int taskPriority = 12;
 const unsigned int stackSize = 25600;
@@ -31,22 +32,21 @@ const unsigned int stackSize = 25600;
 // WebSocket and SSE handlers
 PsychicWebSocketHandler wsHandler;
 PsychicEventSource sseHandler;
-std::vector<int> wsSockets;
-std::vector<int> sseSockets;
+std::vector<int> wsSockets;  // Track WS Clients
+std::vector<int> sseSockets; // Track SSE clients
 
 // Task handles and semaphores
 TaskHandle_t connectionAPHandler = NULL;
 TaskHandle_t asyncServerHandler = NULL;
 TaskHandle_t watchdogHandler = NULL;
 SemaphoreHandle_t xWiFiReadySemaphore;
-SemaphoreHandle_t dataMutex;
+SemaphoreHandle_t dataMutex; // Mutex for thread-safe sensor data access
 
 volatile bool AP_TaskSuccess = false;
 
-// Enhanced Sensor Data Structure for multiple ESP32s
+// Enhanced sensor data structure for multiple clients
 struct SensorData
 {
-  String esp32_id = "N/A";
   String brand_CAR = "N/A";
   String model_CAR = "N/A";
   String pltNum_CAR = "N/A";
@@ -59,12 +59,25 @@ struct SensorData
   String speed_GPS = "N/A";
   String sat_GPS = "N/A";
   String hdop_GPS = "N/A";
-  unsigned long lastUpdate = 0;
-  bool isActive = false;
+  unsigned long lastUpdate = 0; // Timestamp of last update
+  bool isOnline = false;        // Connection status
 };
 
-// Multi-ESP32 data storage
-std::map<String, SensorData> multiESPData;
+// Client registration structure
+struct ESP32Client 
+{
+  String macAddress;
+  String friendlyName;
+  String ipAddress;
+  unsigned long lastSeen;
+  unsigned long registrationTime;
+  bool isActive;
+};
+
+// Multi-client data storage with MAC address as key
+std::map<String, SensorData> clientSensorData;
+std::map<String, ESP32Client> registeredClients;
+String activeClientMAC = ""; // Currently selected client for dashboard display
 
 // Global map for UID to driver name mappings
 std::unordered_map<std::string, std::string> driverMap = {
@@ -90,41 +103,130 @@ String getDriverName(const String &uid)
   }
 }
 
-// Thread-safe data getter for specific ESP32
-SensorData getSensorData(const String &esp32_id)
+// Function to register a new ESP32 client
+bool registerClient(const String &macAddress, const String &ipAddress, const String &friendlyName = "")
 {
+  if (registeredClients.size() >= MAX_ESP32_CLIENTS)
+  {
+    Serial.println("Maximum client limit reached!");
+    return false;
+  }
+
+  ESP32Client newClient;
+  newClient.macAddress = macAddress;
+  newClient.ipAddress = ipAddress;
+  newClient.friendlyName = friendlyName.isEmpty() ? "ESP32_" + macAddress.substring(9) : friendlyName;
+  newClient.lastSeen = millis();
+  newClient.registrationTime = millis();
+  newClient.isActive = true;
+
+  registeredClients[macAddress] = newClient;
+  
+  // Initialize sensor data for this client
+  clientSensorData[macAddress] = SensorData();
+  
+  // If this is the first client, make it the active one
+  if (activeClientMAC.isEmpty())
+  {
+    activeClientMAC = macAddress;
+  }
+
+  Serial.printf("Client registered: MAC=%s, IP=%s, Name=%s\n", 
+                macAddress.c_str(), ipAddress.c_str(), newClient.friendlyName.c_str());
+  return true;
+}
+
+// Function to update client last seen timestamp
+void updateClientActivity(const String &macAddress)
+{
+  if (registeredClients.find(macAddress) != registeredClients.end())
+  {
+    registeredClients[macAddress].lastSeen = millis();
+    registeredClients[macAddress].isActive = true;
+  }
+}
+
+// Function to check for inactive clients (timeout: 30 seconds)
+void checkClientActivity()
+{
+  unsigned long currentTime = millis();
+  const unsigned long TIMEOUT_MS = 30000; // 30 seconds
+
+  for (auto &client : registeredClients)
+  {
+    if (currentTime - client.second.lastSeen > TIMEOUT_MS)
+    {
+      if (client.second.isActive)
+      {
+        client.second.isActive = false;
+        clientSensorData[client.first].isOnline = false;
+        Serial.printf("Client %s marked as inactive\n", client.first.c_str());
+        
+        // If the inactive client was the active one, switch to another active client
+        if (activeClientMAC == client.first)
+        {
+          switchToNextActiveClient();
+        }
+      }
+    }
+  }
+}
+
+// Function to switch to the next active client
+void switchToNextActiveClient()
+{
+  for (const auto &client : registeredClients)
+  {
+    if (client.second.isActive && client.first != activeClientMAC)
+    {
+      activeClientMAC = client.first;
+      Serial.printf("Switched active client to: %s\n", activeClientMAC.c_str());
+      
+      // Broadcast the new active client's data
+      if (clientSensorData.find(activeClientMAC) != clientSensorData.end())
+      {
+        broadcastSensorData(clientSensorData[activeClientMAC], activeClientMAC);
+      }
+      return;
+    }
+  }
+  
+  // No active clients found
+  activeClientMAC = "";
+  Serial.println("No active clients available");
+}
+
+// Thread-safe data getter for specific client
+SensorData getSensorData(const String &macAddress = "")
+{
+  String targetMAC = macAddress.isEmpty() ? activeClientMAC : macAddress;
   SensorData getData;
+  
   if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
   {
-    auto it = multiESPData.find(esp32_id);
-    if (it != multiESPData.end())
+    if (!targetMAC.isEmpty() && clientSensorData.find(targetMAC) != clientSensorData.end())
     {
-      getData = it->second;
+      getData = clientSensorData[targetMAC];
     }
     xSemaphoreGive(dataMutex);
   }
   return getData;
 }
 
-// Thread-safe data getter for all ESP32s
-std::map<String, SensorData> getAllSensorData()
-{
-  std::map<String, SensorData> allData;
-  if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
-  {
-    allData = multiESPData;
-    xSemaphoreGive(dataMutex);
-  }
-  return allData;
-}
-
-// Thread-safe data setter
-void setSensorData(const String &esp32_id, const JsonDocument &doc)
+// Thread-safe data setter for specific client
+void setSensorData(const JsonDocument &doc, const String &macAddress)
 {
   if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
   {
-    SensorData &data = multiESPData[esp32_id];
-    data.esp32_id = esp32_id;
+    // Ensure client data exists
+    if (clientSensorData.find(macAddress) == clientSensorData.end())
+    {
+      clientSensorData[macAddress] = SensorData();
+    }
+    
+    SensorData &data = clientSensorData[macAddress];
+    
+    // Update data fields
     data.brand_CAR = doc["brand"] | data.brand_CAR;
     data.model_CAR = doc["model"] | data.model_CAR;
     data.pltNum_CAR = doc["pltNum"] | data.pltNum_CAR;
@@ -138,16 +240,16 @@ void setSensorData(const String &esp32_id, const JsonDocument &doc)
     data.sat_GPS = doc["sat"] | data.sat_GPS;
     data.hdop_GPS = doc["hdop"] | data.hdop_GPS;
     data.lastUpdate = millis();
-    data.isActive = true;
+    data.isOnline = true;
+    
     xSemaphoreGive(dataMutex);
   }
 }
 
-// Create JSON from sensor data
-String createSensorJSON(const SensorData &data)
+// Create JSON from sensor data with client information
+String createSensorJSON(const SensorData &data, const String &macAddress = "")
 {
   JsonDocument doc;
-  doc["esp32_id"] = data.esp32_id;
   doc["brand"] = data.brand_CAR;
   doc["model"] = data.model_CAR;
   doc["pltNum"] = data.pltNum_CAR;
@@ -161,60 +263,88 @@ String createSensorJSON(const SensorData &data)
   doc["sat"] = data.sat_GPS;
   doc["hdop"] = data.hdop_GPS;
   doc["lastUpdate"] = data.lastUpdate;
-  doc["isActive"] = data.isActive;
+  doc["isOnline"] = data.isOnline;
+  
+  // Add client information if MAC address is provided
+  if (!macAddress.isEmpty() && registeredClients.find(macAddress) != registeredClients.end())
+  {
+    doc["clientMAC"] = macAddress;
+    doc["clientName"] = registeredClients[macAddress].friendlyName;
+    doc["clientIP"] = registeredClients[macAddress].ipAddress;
+  }
 
   String output;
   serializeJson(doc, output);
   return output;
 }
 
-// Create JSON for all ESP32s
-String createAllSensorJSON()
+// Create JSON list of all clients
+String createClientListJSON()
 {
   JsonDocument doc;
-  auto allData = getAllSensorData();
+  JsonArray clients = doc["clients"].to<JsonArray>();
   
-  for (const auto &pair : allData)
+  for (const auto &client : registeredClients)
   {
-    JsonObject espObj = doc[pair.first].to<JsonObject>();
-    espObj["esp32_id"] = pair.second.esp32_id;
-    espObj["brand"] = pair.second.brand_CAR;
-    espObj["model"] = pair.second.model_CAR;
-    espObj["pltNum"] = pair.second.pltNum_CAR;
-    espObj["driver"] = pair.second.driver_RFID;
-    espObj["uid"] = pair.second.uid_RFID;
-    espObj["time"] = pair.second.time_GPS;
-    espObj["long"] = pair.second.long_GPS;
-    espObj["lat"] = pair.second.lat_GPS;
-    espObj["alt"] = pair.second.alt_GPS;
-    espObj["spd"] = pair.second.speed_GPS;
-    espObj["sat"] = pair.second.sat_GPS;
-    espObj["hdop"] = pair.second.hdop_GPS;
-    espObj["lastUpdate"] = pair.second.lastUpdate;
-    espObj["isActive"] = pair.second.isActive;
+    JsonObject clientObj = clients.add<JsonObject>();
+    clientObj["mac"] = client.first;
+    clientObj["name"] = client.second.friendlyName;
+    clientObj["ip"] = client.second.ipAddress;
+    clientObj["active"] = client.second.isActive;
+    clientObj["lastSeen"] = client.second.lastSeen;
+    clientObj["isActive"] = (client.first == activeClientMAC);
+    
+    // Add sensor data status
+    if (clientSensorData.find(client.first) != clientSensorData.end())
+    {
+      clientObj["online"] = clientSensorData[client.first].isOnline;
+      clientObj["lastUpdate"] = clientSensorData[client.first].lastUpdate;
+    }
   }
-
+  
   String output;
   serializeJson(doc, output);
   return output;
 }
 
 // Broadcast data to all clients
-void broadcastSensorData(const String &esp32_id)
+void broadcastSensorData(const SensorData &data, const String &macAddress = "")
 {
-  String jsonData = createAllSensorJSON();
+  String jsonData = createSensorJSON(data, macAddress);
 
-  // WebSocket broadcast
-  for (int sock : wsSockets)
+  // Broadcast to WebSocket clients
+  if (wsSockets.size() < MAX_WS_CLIENTS)
   {
-    if (auto *client = wsHandler.getClient(sock))
+    for (int sock : wsSockets)
     {
-      client->sendMessage(jsonData.c_str());
+      if (auto *client = wsHandler.getClient(sock))
+      {
+        client->sendMessage(jsonData.c_str());
+      }
     }
   }
 
-  // SSE broadcast
-  sseHandler.send("data", jsonData.c_str());
+  // Broadcast to SSE clients
+  if (sseSockets.size() < MAX_SSE_CLIENTS)
+  {
+    sseHandler.send("brand", data.brand_CAR.c_str());
+    sseHandler.send("model", data.model_CAR.c_str());
+    sseHandler.send("pltNum", data.pltNum_CAR.c_str());
+    sseHandler.send("driver", data.driver_RFID.c_str());
+    sseHandler.send("uid", data.uid_RFID.c_str());
+    sseHandler.send("time", data.time_GPS.c_str());
+    sseHandler.send("long", data.long_GPS.c_str());
+    sseHandler.send("lat", data.lat_GPS.c_str());
+    sseHandler.send("alt", data.alt_GPS.c_str());
+    sseHandler.send("spd", data.speed_GPS.c_str());
+    sseHandler.send("sat", data.sat_GPS.c_str());
+    sseHandler.send("hdop", data.hdop_GPS.c_str());
+    sseHandler.send("clientMAC", macAddress.c_str());
+    if (registeredClients.find(macAddress) != registeredClients.end())
+    {
+      sseHandler.send("clientName", registeredClients[macAddress].friendlyName.c_str());
+    }
+  }
 }
 
 // Async server task
@@ -249,7 +379,7 @@ void asyncServer(void *asyncServer)
   // Configure all endpoints
   Serial.println("Configuring Server Endpoints...");
   
-  // Enhanced Dashboard endpoint
+  // HTTP Dashboard endpoint
   server.on("/", HTTP_GET, [](PsychicRequest *req) -> esp_err_t
             {
     String htmlPage = R"rawliteral(
@@ -258,17 +388,8 @@ void asyncServer(void *asyncServer)
         <head>
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>Multi-ESP32 Vehicle Tracking Dashboard</title>
+          <title>Multi-Vehicle Tracking Dashboard</title>
           <style>
-            :root {
-              --primary-red: #CF2E2E;
-              --dark-gray: #202020;
-              --medium-gray: #2A2A2B;
-              --light-gray: #F9F9F9;
-              --orange: #FF6900;
-              --blue: #0693E3;
-            }
-
             * {
               margin: 0;
               padding: 0;
@@ -276,159 +397,95 @@ void asyncServer(void *asyncServer)
             }
 
             body {
-              font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-              background: linear-gradient(135deg, var(--dark-gray) 0%, var(--medium-gray) 100%);
-              color: var(--light-gray);
+              font-family: -apple-system, BlinkMacSystemFont, 'Roboto', 'Segoe UI', sans-serif;
+              background-color: #ffffff0d;
+              color: #020300;
               min-height: 100vh;
-              padding: 1rem;
+              padding: 1.5rem;
+              display: flex;
+              justify-content: center;
+              align-items: flex-start;
+            }
+
+            .container {
+              max-width: 1460px;
+              height: 100%;
+              width: 100%;
+              background: #F7F9F9;
+              border-radius: 8px;
+              box-shadow: 0 4px 20px rgba(129, 23, 27, 0.2);
+              overflow: hidden;
             }
 
             .header {
-              background: linear-gradient(135deg, var(--primary-red) 0%, #8B1E1E 100%);
-              padding: 2rem;
+              background: linear-gradient(90deg, #AD2E24);
+              color: #FFFFFF;
+              padding: 1.5rem;
               text-align: center;
-              margin-bottom: 2rem;
-              border-radius: 12px;
-              box-shadow: 0 8px 32px rgba(207, 46, 46, 0.3);
             }
 
             .header h1 {
-              font-size: 2.5rem;
-              font-weight: 700;
+              font-size: 1.8rem;
+              font-weight: 600;
               margin-bottom: 0.5rem;
-              text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
             }
 
-            .header p {
-              font-size: 1.1rem;
-              opacity: 0.9;
-            }
-
-            .stats-bar {
-              display: flex;
-              justify-content: center;
-              gap: 2rem;
-              margin-bottom: 2rem;
-              flex-wrap: wrap;
-            }
-
-            .stat-item {
-              background: rgba(249, 249, 249, 0.1);
-              padding: 1rem 2rem;
-              border-radius: 8px;
-              backdrop-filter: blur(10px);
-              border: 1px solid rgba(255, 255, 255, 0.1);
-            }
-
-            .stat-value {
-              font-size: 2rem;
-              font-weight: 700;
-              color: var(--orange);
-            }
-
-            .stat-label {
-              font-size: 0.9rem;
-              opacity: 0.8;
-            }
-
-            .connection-status {
+            .status {
               display: inline-flex;
               align-items: center;
-              gap: 0.5rem;
-              padding: 0.5rem 1rem;
-              background: rgba(255, 255, 255, 0.1);
-              border-radius: 20px;
-              font-size: 0.9rem;
+              padding: 0.4rem 1rem;
+              background: rgba(247, 249, 249, 0.3);
+              border-radius: 16px;
+              font-size: 0.85rem;
+              font-weight: 500;
+              margin-right: 1rem;
+            }
+
+            .client-selector {
               margin-top: 1rem;
             }
 
-            .vehicles-grid {
+            .client-selector select {
+              padding: 0.5rem 1rem;
+              border: none;
+              border-radius: 4px;
+              background: rgba(255, 255, 255, 0.9);
+              color: #020300;
+              font-size: 0.9rem;
+            }
+
+            .separator {
+              height: 12px;
+              background-color: #020300;
+              width: 100%;
+            }
+
+            .grid {
               display: grid;
-              grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-              gap: 2rem;
-              margin-bottom: 2rem;
-            }
-
-            .vehicle-card {
-              background: rgba(249, 249, 249, 0.95);
-              color: var(--dark-gray);
-              border-radius: 16px;
-              overflow: hidden;
-              box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
-              transition: transform 0.3s ease, box-shadow 0.3s ease;
-              position: relative;
-            }
-
-            .vehicle-card:hover {
-              transform: translateY(-8px);
-              box-shadow: 0 20px 60px rgba(0, 0, 0, 0.25);
-            }
-
-            .vehicle-card::before {
-              content: '';
-              position: absolute;
-              top: 0;
-              left: 0;
-              right: 0;
-              height: 4px;
-              background: linear-gradient(90deg, var(--primary-red), var(--orange), var(--blue));
-            }
-
-            .vehicle-header {
-              padding: 1.5rem;
-              background: linear-gradient(135deg, var(--light-gray) 0%, #E8E8E8 100%);
-              border-bottom: 2px solid var(--primary-red);
-            }
-
-            .vehicle-id {
-              font-size: 1.2rem;
-              font-weight: 700;
-              color: var(--primary-red);
-              margin-bottom: 0.5rem;
-            }
-
-            .vehicle-status {
-              display: inline-flex;
-              align-items: center;
-              gap: 0.5rem;
-              padding: 0.25rem 0.75rem;
-              border-radius: 12px;
-              font-size: 0.8rem;
-              font-weight: 600;
-            }
-
-            .status-active {
-              background: rgba(40, 167, 69, 0.2);
-              color: #28a745;
-            }
-
-            .status-inactive {
-              background: rgba(220, 53, 69, 0.2);
-              color: #dc3545;
-            }
-
-            .vehicle-body {
-              padding: 1.5rem;
-            }
-
-            .data-sections {
-              display: grid;
-              grid-template-columns: 1fr 1fr;
+              grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
               gap: 1.5rem;
+              padding: 1.5rem;
             }
 
-            .data-section {
-              background: rgba(42, 42, 43, 0.05);
-              padding: 1rem;
+            .card {
+              background: #ffffff;
+              padding: 15px;
               border-radius: 8px;
-              border-left: 3px solid var(--primary-red);
+              border-left: 3px solid #C83F12;
+              box-shadow: 0 2px 8px rgba(129, 23, 27, 0.1);
+              transition: transform 0.2s ease, box-shadow 0.2s ease;
             }
 
-            .section-title {
-              font-size: 1rem;
-              font-weight: 600;
+            .card:hover {
+              transform: translateY(-4px);
+              box-shadow: 0 6px 16px rgba(129, 23, 27, 0.4);
+            }
+
+            .card h2 {
+              color: #020300;
+              font-size: 1.3rem;
+              font-weight: 500;
               margin-bottom: 1rem;
-              color: var(--primary-red);
               display: flex;
               align-items: center;
               gap: 0.5rem;
@@ -438,373 +495,314 @@ void asyncServer(void *asyncServer)
               display: flex;
               justify-content: space-between;
               align-items: center;
-              margin-bottom: 0.75rem;
-              padding: 0.5rem 0;
-              border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+              padding: 0.6rem 0;
+              border-bottom: 1px solid #e8ecef;
             }
 
             .data-row:last-child {
               border-bottom: none;
-              margin-bottom: 0;
             }
 
-            .data-label {
-              font-size: 0.85rem;
+            .label {
+              font-size: 0.9rem;
+              font-weight: 500;
               color: #666;
+              flex: 1;
+            }
+
+            .value {
+              font-size: 0.95rem;
+              font-weight: 600;
+              color: #020300;
+              background: #F7F9F9;
+              padding: 0.3rem 0.6rem;
+              border-radius: 4px;
+              flex: 1;
+              text-align: right;
+              transition: background-color 0.3s ease;
+            }
+
+            .icon {
+              font-size: 1.2rem;
+            }
+
+            @keyframes fadeIn {
+              from {
+                opacity: 0;
+              }
+
+              to {
+                opacity: 1;
+              }
+            }
+
+            .value.updated {
+              animation: fadeIn 0.5s ease;
+              background-color: #fff3e6;
+            }
+
+            .client-status {
+              padding: 0.2rem 0.5rem;
+              border-radius: 12px;
+              font-size: 0.8rem;
               font-weight: 500;
             }
 
-            .data-value {
-              font-size: 0.9rem;
-              font-weight: 600;
-              color: var(--dark-gray);
-              background: rgba(6, 147, 227, 0.1);
-              padding: 0.25rem 0.5rem;
-              border-radius: 4px;
-              transition: all 0.3s ease;
+            .client-status.online {
+              background: #d4edda;
+              color: #155724;
             }
 
-            .data-value.updated {
-              background: rgba(255, 105, 0, 0.2);
-              transform: scale(1.05);
-            }
-
-            .no-vehicles {
-              text-align: center;
-              padding: 3rem;
-              background: rgba(249, 249, 249, 0.1);
-              border-radius: 12px;
-              backdrop-filter: blur(10px);
-            }
-
-            .no-vehicles h2 {
-              font-size: 1.5rem;
-              margin-bottom: 1rem;
-              color: var(--orange);
-            }
-
-            .last-update {
-              font-size: 0.75rem;
-              color: #888;
-              text-align: right;
-              margin-top: 1rem;
+            .client-status.offline {
+              background: #f8d7da;
+              color: #721c24;
             }
 
             @media (max-width: 768px) {
-              .header h1 {
-                font-size: 2rem;
+              body {
+                padding: 1rem;
               }
-              
-              .stats-bar {
+
+              .grid {
+                grid-template-columns: 1fr;
                 gap: 1rem;
               }
-              
-              .vehicles-grid {
-                grid-template-columns: 1fr;
+
+              .header h1 {
+                font-size: 1.5rem;
               }
-              
-              .data-sections {
-                grid-template-columns: 1fr;
+
+              .card {
+                padding: 1rem;
               }
             }
 
-            @keyframes pulse {
-              0% { opacity: 1; }
-              50% { opacity: 0.7; }
-              100% { opacity: 1; }
-            }
+            @media (max-width: 480px) {
+              .header {
+                padding: 1rem;
+              }
 
-            .pulse {
-              animation: pulse 2s infinite;
+              .status {
+                font-size: 0.75rem;
+              }
+
+              .card h2 {
+                font-size: 1.1rem;
+              }
+
+              .label,
+              .value {
+                font-size: 0.85rem;
+              }
             }
           </style>
         </head>
         <body>
-          <div class="header">
-            <h1>🚗 Multi-ESP32 Vehicle Tracking</h1>
-            <p>Real-time monitoring of multiple vehicles and drivers</p>
-            <div class="connection-status" id="connectionStatus">
-              <span id="statusIcon">🔄</span>
-              <span id="statusText">Connecting...</span>
+          <div class="container">
+            <div class="header">
+              <h1>Multi-Vehicle Tracking Dashboard</h1>
+              <div class="status" id="connectionStatus">Connecting...</div>
+              <div class="client-selector">
+                <label for="clientSelect" style="color: white; margin-right: 0.5rem;">Active Client:</label>
+                <select id="clientSelect">
+                  <option value="">No clients available</option>
+                </select>
+              </div>
             </div>
-          </div>
-
-          <div class="stats-bar">
-            <div class="stat-item">
-              <div class="stat-value" id="totalVehicles">0</div>
-              <div class="stat-label">Total Vehicles</div>
-            </div>
-            <div class="stat-item">
-              <div class="stat-value" id="activeVehicles">0</div>
-              <div class="stat-label">Active Now</div>
-            </div>
-            <div class="stat-item">
-              <div class="stat-value" id="connectedESPs">0</div>
-              <div class="stat-label">ESP32 Devices</div>
-            </div>
-          </div>
-
-          <div class="vehicles-grid" id="vehiclesGrid">
-            <div class="no-vehicles">
-              <h2>No Vehicles Connected</h2>
-              <p>Waiting for ESP32 devices to send data...</p>
-            </div>
-          </div>
-
-          <script>
-            let wsConnected = false, sseConnected = false;
-            let vehicleData = {};
-
-            function updateConnectionStatus() {
-              const statusIcon = document.getElementById('statusIcon');
-              const statusText = document.getElementById('statusText');
-              const status = document.getElementById('connectionStatus');
-              
-              if (wsConnected || sseConnected) {
-                statusIcon.textContent = '🟢';
-                statusText.textContent = 'Connected';
-                status.style.background = 'rgba(40, 167, 69, 0.2)';
-                status.style.color = '#28a745';
-              } else {
-                statusIcon.textContent = '🔴';
-                statusText.textContent = 'Disconnected';
-                status.style.background = 'rgba(220, 53, 69, 0.2)';
-                status.style.color = '#dc3545';
-              }
-            }
-
-            function updateStats() {
-              const totalVehicles = Object.keys(vehicleData).length;
-              const activeVehicles = Object.values(vehicleData).filter(v => v.isActive).length;
-              
-              document.getElementById('totalVehicles').textContent = totalVehicles;
-              document.getElementById('activeVehicles').textContent = activeVehicles;
-              document.getElementById('connectedESPs').textContent = totalVehicles;
-            }
-
-            function createVehicleCard(espId, data) {
-              const isActive = data.isActive && (Date.now() - data.lastUpdate < 30000);
-              const lastUpdateTime = new Date(data.lastUpdate).toLocaleString();
-              
-              return `
-                <div class="vehicle-card ${isActive ? 'active' : 'inactive'}">
-                  <div class="vehicle-header">
-                    <div class="vehicle-id">ESP32: ${espId}</div>
-                    <div class="vehicle-status ${isActive ? 'status-active' : 'status-inactive'}">
-                      <span>${isActive ? '🟢' : '🔴'}</span>
-                      ${isActive ? 'Active' : 'Inactive'}
-                    </div>
-                  </div>
-                  <div class="vehicle-body">
-                    <div class="data-sections">
-                      <div class="data-section">
-                        <div class="section-title">🔖 Driver Info</div>
-                        <div class="data-row">
-                          <span class="data-label">Driver:</span>
-                          <span class="data-value">${data.driver || 'N/A'}</span>
-                        </div>
-                        <div class="data-row">
-                          <span class="data-label">Card UID:</span>
-                          <span class="data-value">${data.uid || 'N/A'}</span>
-                        </div>
-                      </div>
-                      <div class="data-section">
-                        <div class="section-title">🚗 Vehicle</div>
-                        <div class="data-row">
-                          <span class="data-label">Brand:</span>
-                          <span class="data-value">${data.brand || 'N/A'}</span>
-                        </div>
-                        <div class="data-row">
-                          <span class="data-label">Model:</span>
-                          <span class="data-value">${data.model || 'N/A'}</span>
-                        </div>
-                        <div class="data-row">
-                          <span class="data-label">Plate:</span>
-                          <span class="data-value">${data.pltNum || 'N/A'}</span>
-                        </div>
-                      </div>
-                      <div class="data-section">
-                        <div class="section-title">📍 Location</div>
-                        <div class="data-row">
-                          <span class="data-label">Time:</span>
-                          <span class="data-value">${data.time || 'N/A'}</span>
-                        </div>
-                        <div class="data-row">
-                          <span class="data-label">Latitude:</span>
-                          <span class="data-value">${data.lat || 'N/A'}</span>
-                        </div>
-                        <div class="data-row">
-                          <span class="data-label">Longitude:</span>
-                          <span class="data-value">${data.long || 'N/A'}</span>
-                        </div>
-                      </div>
-                      <div class="data-section">
-                        <div class="section-title">📊 Metrics</div>
-                        <div class="data-row">
-                          <span class="data-label">Speed:</span>
-                          <span class="data-value">${data.spd || 'N/A'} km/h</span>
-                        </div>
-                        <div class="data-row">
-                          <span class="data-label">Satellites:</span>
-                          <span class="data-value">${data.sat || 'N/A'}</span>
-                        </div>
-                        <div class="data-row">
-                          <span class="data-label">HDOP:</span>
-                          <span class="data-value">${data.hdop || 'N/A'}</span>
-                        </div>
-                      </div>
-                    </div>
-                    <div class="last-update">Last update: ${lastUpdateTime}</div>
-                  </div>
+            <div class="separator"></div>
+            <div class="grid">
+              <div class="card">
+                <h2><span class="icon">🖥️</span>Client Information</h2>
+                <div class="data-row">
+                  <span class="label">Client Name:</span>
+                  <span class="value" id="clientName">N/A</span>
                 </div>
-              `;
-            }
-
-            function updateVehicleDisplay() {
-              const grid = document.getElementById('vehiclesGrid');
-              
-              if (Object.keys(vehicleData).length === 0) {
-                grid.innerHTML = `
-                  <div class="no-vehicles">
-                    <h2>No Vehicles Connected</h2>
-                    <p>Waiting for ESP32 devices to send data...</p>
-                  </div>
-                `;
+                <div class="data-row">
+                  <span class="label">MAC Address:</span>
+                  <span class="value" id="clientMAC">N/A</span>
+                </div>
+                <div class="data-row">
+                  <span class="label">Status:</span>
+                  <span class="value client-status" id="clientStatus">N/A</span>
+                </div>
+              </div>
+              <div class="card">
+                <h2><span class="icon">🔖</span>Driver Details</h2>
+                <div class="data-row">
+                  <span class="label">Driver:</span>
+                  <span class="value" id="driver">N/A</span>
+                </div>
+                <div class="data-row">
+                  <span class="label">Card UID:</span>
+                  <span class="value" id="uid">N/A</span>
+                </div>
+              </div>
+              <div class="card">
+                <h2><span class="icon">🪪</span>Vehicle Data</h2>
+                <div class="data-row">
+                  <span class="label">Brand:</span>
+                  <span class="value" id="brand">N/A</span>
+                </div>
+                <div class="data-row">
+                  <span class="label">Model:</span>
+                  <span class="value" id="model">N/A</span>
+                </div>
+                <div class="data-row">
+                  <span class="label">Plate Number:</span>
+                  <span class="value" id="pltNum">N/A</span>
+                </div>
+              </div>
+              <div class="card">
+                <h2><span class="icon">📍</span>GPS Location</h2>
+                <div class="data-row">
+                  <span class="label">Time (UTC):</span>
+                  <span class="value" id="time">N/A</span>
+                </div>
+                <div class="data-row">
+                  <span class="label">Latitude:</span>
+                  <span class="value" id="lat">N/A</span>
+                </div>
+                <div class="data-row">
+                  <span class="label">Longitude:</span>
+                  <span class="value" id="long">N/A</span>
+                </div>
+                <div class="data-row">
+                  <span class="label">Altitude (m):</span>
+                  <span class="value" id="alt">N/A</span>
+                </div>
+              </div>              
+              <div class="card">
+                <h2><span class="icon">🚗</span>Movement Data</h2>
+                <div class="data-row">
+                  <span class="label">Speed (km/h):</span>
+                  <span class="value" id="spd">N/A</span>
+                </div>
+                <div class="data-row">
+                  <span class="label">Satellites:</span>
+                  <span class="value" id="sat">N/A</span>
+                </div>
+                <div class="data-row">
+                  <span class="label">HDOP:</span>
+                  <span class="value" id="hdop">N/A</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <script>
+            const status = document.getElementById('connectionStatus');
+            const clientSelect = document.getElementById('clientSelect');
+            let wsConnected = false, sseConnected = false;
+            let clients = {};
+            
+            function updateStatus() {
+              if (wsConnected || sseConnected) {
+                status.textContent = '🟢 Connected';
+                status.style.background = 'rgba(40, 167, 69, 0.8)';
               } else {
-                grid.innerHTML = Object.entries(vehicleData)
-                  .map(([espId, data]) => createVehicleCard(espId, data))
-                  .join('');
+                status.textContent = '🔴 Disconnected';
+                status.style.background = 'rgba(220, 53, 69, 0.8)';
               }
-              
-              updateStats();
             }
-
-            function processData(data) {
-              if (typeof data === 'string') {
-                try {
-                  data = JSON.parse(data);
-                } catch (e) {
-                  console.error('JSON parse error:', e);
-                  return;
+            
+            function updateField(id, value, animate = true) {
+              const element = document.getElementById(id);
+              if (element && element.textContent !== value) {
+                element.textContent = value;
+                if (animate) {
+                  element.classList.add('updated');
+                  setTimeout(() => element.classList.remove('updated'), 500);
                 }
               }
-              
-              vehicleData = data;
-              updateVehicleDisplay();
             }
 
-            // WebSocket connection
-            const ws = new WebSocket(`ws://${location.host}/ws`);
-            ws.onopen = () => {
-              wsConnected = true;
-              updateConnectionStatus();
-              console.log('WebSocket connected');
-            };
-            ws.onclose = () => {
-              wsConnected = false;
-              updateConnectionStatus();
-              console.log('WebSocket disconnected');
-            };
-            ws.onmessage = (e) => {
-              processData(e.data);
-            };
+            function updateClientSelect(clientsData) {
+              clientSelect.innerHTML = '';
+              if (clientsData.clients && clientsData.clients.length > 0) {
+                clientsData.clients.forEach(client => {
+                  const option = document.createElement('option');
+                  option.value = client.mac;
+                  option.textContent = client.name + (client.active ? ' (Online)' : ' (Offline)');
+                  if (client.isActive) option.selected = true;
+                  clientSelect.appendChild(option);
+                });
+              } else {
+                const option = document.createElement('option');
+                option.value = '';
+                option.textContent = 'No clients available';
+                clientSelect.appendChild(option);
+              }
+            }
 
-            // SSE connection
-            const sse = new EventSource('/events');
-            sse.onopen = () => {
-              sseConnected = true;
-              updateConnectionStatus();
-              console.log('SSE connected');
-            };
-            sse.onerror = () => {
-              sseConnected = false;
-              updateConnectionStatus();
-              console.log('SSE error');
-            };
-            sse.addEventListener('data', (e) => {
-              processData(e.data);
+            // Client selection change handler
+            clientSelect.addEventListener('change', function() {
+              if (this.value) {
+                fetch('/switch-client', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ mac: this.value })
+                });
+              }
             });
 
-            // Initial status update
-            updateConnectionStatus();
-            updateVehicleDisplay();
+            const ws = new WebSocket(`ws://${location.host}/ws`);
+            ws.onopen = () => { wsConnected = true; updateStatus(); };
+            ws.onclose = () => { wsConnected = false; updateStatus(); };
+            ws.onmessage = e => {
+              try {
+                const d = JSON.parse(e.data);
+                Object.keys(d).forEach(key => {
+                  if (key === 'clientMAC') {
+                    updateField('clientMAC', d[key]);
+                  } else if (key === 'clientName') {
+                    updateField('clientName', d[key]);
+                  } else if (key === 'isOnline') {
+                    const statusEl = document.getElementById('clientStatus');
+                    if (statusEl) {
+                      statusEl.textContent = d[key] ? 'Online' : 'Offline';
+                      statusEl.className = 'value client-status ' + (d[key] ? 'online' : 'offline');
+                    }
+                  } else {
+                    updateField(key, d[key]);
+                  }
+                });
+              } catch (err) { console.error('WS JSON parse:', err); }
+            };
 
-            // Periodic inactive check
+            const sse = new EventSource('/events');
+            sse.onopen = () => { sseConnected = true; updateStatus(); };
+            sse.onerror = () => { sseConnected = false; updateStatus(); };
+            
+            // SSE event listeners for sensor data
+            ['driver', 'uid', 'time', 'long', 'lat', 'alt', 'spd', 'sat', 'hdop', 'brand', 'model', 'pltNum'].forEach(field => {
+              sse.addEventListener(field, e => updateField(field, e.data));
+            });
+            
+            // SSE event listeners for client data
+            sse.addEventListener('clientMAC', e => updateField('clientMAC', e.data));
+            sse.addEventListener('clientName', e => updateField('clientName', e.data));
+
+            // Fetch client list periodically
             setInterval(() => {
-              let updated = false;
-              for (let espId in vehicleData) {
-                const wasActive = vehicleData[espId].isActive;
-                const isActive = (Date.now() - vehicleData[espId].lastUpdate) < 30000;
-                if (wasActive !== isActive) {
-                  vehicleData[espId].isActive = isActive;
-                  updated = true;
-                }
-              }
-              if (updated) {
-                updateVehicleDisplay();
-              }
+              fetch('/clients')
+                .then(response => response.json())
+                .then(data => updateClientSelect(data))
+                .catch(err => console.error('Error fetching clients:', err));
             }, 5000);
+
+            updateStatus();
           </script>
         </body>
         </html>
       )rawliteral";
-
     static String htmlCopy;
     htmlCopy = htmlPage;
     return req->reply(200, "text/html", htmlCopy.c_str()); });
 
-  // WebSocket endpoint
+  // < ------ Continue from here ------ >
+  // WebSocket endpoint 
   server.on("/ws", HTTP_GET, &wsHandler);
   wsHandler.onOpen([](PsychicWebSocketClient *client)
                    {
     if (wsSockets.size() >= MAX_WS_CLIENTS)
     {
-      client->sendMessage("Max Clients Reached");
-      client->close();
-      return;
-    }
-    int sock = client->socket();
-    wsSockets.push_back(sock);
-    Serial.printf("WebSocket Client Connected: Socket %d\n", sock);
-
-    // Send current data to new client
-    String jsonData = createAllSensorJSON();
-    client->sendMessage(jsonData.c_str()); });
-
-  wsHandler.onFrame([](PsychicWebSocketRequest *request, httpd_ws_frame *frame) -> int
-                    {
-    String msg = String((const char *)frame->payload, frame->len);
-    Serial.println("WS Received: " + msg);
-    return 0; });
-
-  wsHandler.onClose([](PsychicWebSocketClient *client)
-                    {
-    int sock = client->socket();
-    wsSockets.erase(std::remove(wsSockets.begin(), wsSockets.end(), sock), wsSockets.end());
-    Serial.printf("WebSocket Client Disconnected: Socket %d\n", sock); });
-
-  // SSE endpoint
-  server.on("/events", HTTP_GET, &sseHandler);
-  sseHandler.onOpen([](PsychicEventSourceClient *client)
-                    {
-    if (sseSockets.size() >= MAX_SSE_CLIENTS)
-    {
-      client->send("Max Clients Reached", "error");
-      client->close();
-      return;
-    }
-    int sock = client->socket();
-    sseSockets.push_back(sock);
-    Serial.println("SSE Client Connected");
-
-    // Send current data to new client
-    String jsonData = createAllSensorJSON();
-    client->send("data", jsonData.c_str()); });
-
-  sseHandler.onClose([](PsychicEventSourceClient *client)
-                     {
-    int sock = client->socket();
-    sseSockets.erase(std::remove(sseSockets.begin(), sseSockets.end(), sock), sseSockets.end());
-    Serial.println("SSE client disconnected"); });
-
-  // Enhanced data upload endpoint
+      client->sendMessage("Max
