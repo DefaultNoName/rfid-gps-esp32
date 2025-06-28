@@ -62,9 +62,9 @@ struct SensorData
 // Global map for UID to driver name mappings
 std::unordered_map<std::string, std::string> driverMap = {
     {"5394B838", "Allan M."},
-    {"63A70F02", "Paul Lino"},
+    {"63A70F02", "Paulino"},
     {"FB1D0F02", "Dave"},
-    {"D9C5A998", "Rey"},
+    {"D9C5A998", "Poging Drayber"},
     {"9AC8BE24", "Grow A Garden Dela Cruz"},
     {"129791AB", "Mama mo"}};
 
@@ -515,7 +515,7 @@ void asyncServer(void *asyncServer)
         </body>
         </html>
       )rawliteral";
-    // Assign to a local variable to ensure the buffer stays valid
+    // Local variable to ensure the buffer stays valid
     static String htmlCopy;
     htmlCopy = htmlPage;
     return req->reply(200, "text/html", htmlCopy.c_str()); });
@@ -736,28 +736,5 @@ void setup()
 
 void loop()
 {
-  /*
-  static unsigned long lastHealthCheck = 0;
-  static unsigned long lastTaskCheck = 0;
-
-  if (millis() - lastHealthCheck > 30000)
-  {
-    int freeHeap = ESP.getFreeHeap();
-    int connectedClients = WiFi.softAPgetStationNum();
-    Serial.printf("System Health: Free Heap: %d, Connected Clients: %d\n", freeHeap, connectedClients);
-    if (freeHeap < 20000)
-    {
-      Serial.println("WARNING: Low free heap memory!");
-    }
-    lastHealthCheck = millis();
-  }
-
-  // Add task status checking every 10 seconds
-  if (millis() - lastTaskCheck > 10000)
-  {
-    printTaskStatus();
-    lastTaskCheck = millis();
-  }*/
-
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
