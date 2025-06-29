@@ -1,3 +1,1 @@
-testing
-85% ey_AY
-not confident (disgrace)
+Testing | 85% AI Generated | Not Confident
