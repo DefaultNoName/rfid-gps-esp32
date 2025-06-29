@@ -1,3 +1,4 @@
+// Proof-of-Concept Project
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
@@ -736,5 +737,5 @@ void setup()
 
 void loop()
 {
-  vTaskDelay(pdMS_TO_TICKS(1000));
+  vTaskDelay(pdMS_TO_TICKS(100)); // Prevent watchdog issues
 }
