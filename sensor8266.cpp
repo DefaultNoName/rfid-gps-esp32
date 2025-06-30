@@ -1,4 +1,4 @@
-// Proof-of-Concept Project
+// Proof-of-Concept Project - ESP8266 Port
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -18,13 +18,21 @@ const char *serverIP = "192.168.120.1";
 const int serverPort = 80;
 const char *uploadPath = "/upload";
 
-// Hardware pins
-// #define SS_PIN 5       // Slave Select for RFID
-// #define RST_PIN 21     // Reset Pin for RFID
-#define RX_PIN 4          // GPIO 4 | D2 for GPS
-#define TX_PIN 5          // GPIO 5 | D1 for GPS
+// Hardware pins for ESP8266 (NodeMCU/Wemos D1 Mini mapping)
+// RFID MFRC522 pins - Standard SPI connections
+#define SS_PIN 15 // D8 - GPIO15 (SS/CS pin for RFID)
+#define RST_PIN 0 // D3 - GPIO0 (RST pin for RFID)
+// Note: SPI pins are fixed on ESP8266: SCK=GPIO14(D5), MOSI=GPIO13(D7), MISO=GPIO12(D6)
 
-// System States for Psuedo-Multitasking 
+// GPS pins - Using SoftwareSerial library
+#define GPS_RX_PIN 4 // D2 - GPIO4 (connect to GPS TX)
+#define GPS_TX_PIN 5 // D1 - GPIO5 (connect to GPS RX)
+
+// LED indicators
+#define BUILTIN_LED_PIN 2 // GPIO2 (onboard LED - active LOW on ESP8266)
+#define RFID_LED_PIN 16   // D0 - GPIO16 (external LED indicator)
+
+// System States for Pseudo-Multitasking
 enum SystemState
 {
   STATE_INIT,
@@ -50,15 +58,13 @@ SystemState currentState = STATE_INIT;
 ComponentStatus components;
 WiFiClient client;
 HTTPClient http;
-// Hardware variables
-MFRC522DriverPinSimple slaveSelect(5);
-MFRC522DriverSPI driver{slaveSelect};
+
+// Hardware variables - Fixed pin assignments
+MFRC522DriverPinSimple ss_pin(SS_PIN);
+MFRC522DriverSPI driver{ss_pin};
 MFRC522 module_RFID{driver};
 TinyGPSPlus module_GPS;
-SoftwareSerial SerialGPS(RX_PIN, TX_PIN);
-
-int espBUILT_IN = 2;
-int rfidLED_IND = 33;
+SoftwareSerial SerialGPS(GPS_RX_PIN, GPS_TX_PIN);
 
 // Timing variables
 unsigned long lastWifiAttempt = 0;
@@ -83,11 +89,11 @@ String currentGPS_speed = "N/A";
 String currentGPS_sats = "N/A";
 String currentGPS_hdop = "N/A";
 
-// Testing - Get PHYS Address from eFuse as Device UUID
+// Fixed MAC address retrieval for ESP8266
 String getPHYS_ADDR()
 {
   String mac = WiFi.macAddress();
-  mac.replace("", ""); // Remove colons to match your format
+  mac.replace(":", ""); // Remove colons to match format
   return mac;
 }
 const String PHYS_ADDR_STR = getPHYS_ADDR();
@@ -99,8 +105,8 @@ void handleInitState()
   Serial.println("=== System Initialization ===");
   Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
 
-  // Basic memory check
-  if (ESP.getFreeHeap() < 20000)
+  // ESP8266 has less RAM - adjust threshold accordingly
+  if (ESP.getFreeHeap() < 10000)
   {
     Serial.println("Insufficient memory available, restarting...");
     delay(1000);
@@ -124,7 +130,7 @@ void handleWifiConnecting()
 
   if (!wifiStarted)
   {
-    Serial.println("Starting WiFi connection...");
+    Serial.println("Starting WiFi Connection...");
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(false); // We'll handle reconnection manually
     WiFi.setSleepMode(WIFI_NONE_SLEEP);
@@ -151,8 +157,8 @@ void handleWifiConnecting()
 
     if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL)
     {
-      Serial.printf("\nWiFi connection failed with status: %d\n", status);
-      components.last_error = "WiFi authentication failed";
+      Serial.printf("\nWiFi Connection Failed with Status: %d\n", status);
+      components.last_error = "WiFi authentication Failed";
       currentState = STATE_ERROR;
       return;
     }
@@ -293,8 +299,8 @@ void handleRFIDReading()
 
   if (module_RFID.PICC_IsNewCardPresent() && module_RFID.PICC_ReadCardSerial())
   {
-    digitalWrite(espBUILT_IN, HIGH); // Scan Indicator
-    // digitalWrite(rfidLED_IND, HIGH);
+    digitalWrite(BUILTIN_LED_PIN, LOW); // Turn on LED (active LOW)
+    digitalWrite(RFID_LED_PIN, HIGH);   // Turn on external LED
 
     String uid = "";
     for (byte i = 0; i < module_RFID.uid.size; i++)
@@ -304,6 +310,7 @@ void handleRFIDReading()
       uid += String(module_RFID.uid.uidByte[i], HEX);
     }
     uid.toUpperCase();
+
     // Simple debouncing
     if (uid != lastUID || (millis() - lastValidRead) > 2000)
     {
@@ -312,12 +319,13 @@ void handleRFIDReading()
       lastUID = uid;
       lastValidRead = millis();
     }
+
     module_RFID.PICC_HaltA();
     module_RFID.PCD_StopCrypto1();
 
     delay(1000);
-    digitalWrite(espBUILT_IN, LOW);
-    // digitalWrite(rfidLED_IND, LOW);
+    digitalWrite(BUILTIN_LED_PIN, HIGH); // Turn off LED (active LOW)
+    digitalWrite(RFID_LED_PIN, LOW);     // Turn off external LED
   }
 }
 
@@ -329,7 +337,7 @@ void handleGPSReading()
     {
       if (module_GPS.time.isValid())
       {
-        char timeStr[9];
+        char timeStr[12];
         snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
                  module_GPS.time.hour(), module_GPS.time.minute(), module_GPS.time.second());
         currentGPS_time = String(timeStr);
@@ -370,7 +378,7 @@ void handleHTTPTransmission()
 
   String url = String("http://") + serverIP + ":" + String(serverPort) + uploadPath;
 
-  http.begin(client, url);
+  http.begin(client, url); // Correct ESP8266HTTPClient syntax
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(5000);
 
@@ -401,8 +409,8 @@ void handleHealthCheck()
                 components.gps_ok ? "OK" : "FAIL",
                 components.http_ok ? "OK" : "FAIL");
 
-  // Memory check
-  if (ESP.getFreeHeap() < 20000)
+  // ESP8266 memory check - lower threshold
+  if (ESP.getFreeHeap() < 8000)
   {
     Serial.println("WARNING: Low memory, restarting system");
     delay(1000);
@@ -457,15 +465,19 @@ void handleRunningState()
 
 void setup()
 {
-  system_update_cpu_freq(160); // Set CPU Frequency
+  // ESP8266 doesn't have setCpuFrequencyMhz - use system_update_cpu_freq instead
+  system_update_cpu_freq(160); // 160MHz for ESP8266
   Serial.begin(115200);
   delay(1000);
 
-  // LED Scan Indicators
-  pinMode(espBUILT_IN, OUTPUT);
-  pinMode(rfidLED_IND, OUTPUT);
+  // Initialize LED pins
+  pinMode(BUILTIN_LED_PIN, OUTPUT);
+  pinMode(RFID_LED_PIN, OUTPUT);
+  digitalWrite(BUILTIN_LED_PIN, HIGH); // Turn off builtin LED (active LOW)
+  digitalWrite(RFID_LED_PIN, LOW);     // Turn off external LED
 
-  Serial.println(PHYS_ADDR_STR); // <--- Testing as Device UUID
+  Serial.println("=== ESP8266 RFID-GPS System ===");
+  Serial.println("Device UUID: " + PHYS_ADDR_STR);
 
   // Start with initialization state
   currentState = STATE_INIT;
