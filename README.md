@@ -1,2 +1,3 @@
-Testing | 85% AI Generated 
-i should be ashamed
+ 
+85% AI generated code 
+(i should be ashamed)
