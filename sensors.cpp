@@ -1,4 +1,4 @@
-// Proof-of-Concept Project
+// Proof-of-Concept Project - ESP32 Port
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -22,6 +22,10 @@ const char *uploadPath = "/upload";
 // #define SS_PIN 5
 #define RX_PIN 16
 #define TX_PIN 17
+
+// LED indicators
+#define BUILTIN_LED_PIN 2 // Blue LED
+#define RFID_LED_PIN 33
 
 // System States
 enum SystemState
@@ -48,15 +52,13 @@ struct ComponentStatus
 SystemState currentState = STATE_INIT;
 ComponentStatus components;
 HTTPClient http;
-// Hardware variables
+
+// Hardware variables - Fixed pin assignments
 MFRC522DriverPinSimple ss_pin(5);
 MFRC522DriverSPI driver{ss_pin};
 MFRC522 module_RFID{driver};
 TinyGPSPlus module_GPS;
 HardwareSerial SerialGPS(2);
-
-int espBUILT_IN = 2;
-int rfidLED_IND = 33;
 
 // Timing variables
 unsigned long lastWifiAttempt = 0;
@@ -69,7 +71,7 @@ unsigned long stateTimeout = 0;
 // Vehicle constants
 const char *VEHICLE_BRAND = "Toyota";
 const char *VEHICLE_MODEL = "Tamaraw FX";
-const char *VEHICLE_PLATE = "XYZ720";
+const char *VEHICLE_PLATE = "UAM981";
 
 // Data storage
 String currentRFID = "N/A";
@@ -294,8 +296,8 @@ void handleRFIDReading()
 
     if (module_RFID.PICC_IsNewCardPresent() && module_RFID.PICC_ReadCardSerial())
     {
-        digitalWrite(espBUILT_IN, HIGH); // Scan Indicator
-        // digitalWrite(rfidLED_IND, HIGH);
+        digitalWrite(BUILTIN_LED_PIN, HIGH); // Scan Indicator
+        // digitalWrite(RFID_LED_PIN, HIGH);
 
         String uid = "";
         for (byte i = 0; i < module_RFID.uid.size; i++)
@@ -317,8 +319,8 @@ void handleRFIDReading()
         module_RFID.PCD_StopCrypto1();
 
         delay(1000);
-        digitalWrite(espBUILT_IN, LOW);
-        // digitalWrite(rfidLED_IND, LOW);
+        digitalWrite(BUILTIN_LED_PIN, LOW);
+        // digitalWrite(RFID_LED_PIN, LOW);
     }
 }
 
@@ -463,8 +465,8 @@ void setup()
     delay(1000);
 
     // LED Scan Indicators
-    pinMode(espBUILT_IN, OUTPUT);
-    pinMode(rfidLED_IND, OUTPUT);
+    pinMode(BUILTIN_LED_PIN, OUTPUT);
+    pinMode(RFID_LED_PIN, OUTPUT);
 
     Serial.println(PHYS_ADDR_STR); // <--- Testing as Device UUID
 
