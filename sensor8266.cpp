@@ -466,7 +466,7 @@ void handleRunningState()
 void setup()
 {
   // ESP8266 doesn't have setCpuFrequencyMhz - use system_update_cpu_freq instead
-  system_update_cpu_freq(160); // 160MHz for ESP8266
+  system_update_cpu_freq(120); // 160MHz for ESP8266
   Serial.begin(115200);
   delay(1000);
 
