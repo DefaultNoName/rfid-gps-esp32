@@ -3,10 +3,10 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_http_server.h>
-#include <PsychicHttp.h>
-#include <ArduinoJson.h>
-#include <vector>
 #include <unordered_map>
+#include <vector>
+#include <PsychicHttp.h> // Library for Asynchronous Webserver
+#include <ArduinoJson.h>
 
 // WiFi configuration
 IPAddress AP_IP = IPAddress(192, 168, 120, 1); // IP Address
@@ -69,10 +69,10 @@ std::unordered_map<std::string, std::string> driverMap = {
     {"9AC8BE24", "Grow A Garden Dela Cruz"},
     {"129791AB", "Mama mo"}};
 
-// Function to get driver name from UID
+// Get driver name from UID
 String getDriverName(const String &uid)
 {
-  // Convert Arduino String to std::string for map lookup
+  // Convert Arduino String to std::string (C) for map lookup
   std::string uidStd = uid.c_str();
 
   // Look up the UID in the map
@@ -588,7 +588,7 @@ void asyncServer(void *asyncServer)
     sseSockets.erase(std::remove(sseSockets.begin(), sseSockets.end(), sock), sseSockets.end());
     Serial.println("SSE client disconnected"); });
 
-  // Data upload endpoint
+  // Data upload endpoint - from ESP8266 sensor node
   server.on("/upload", HTTP_POST, [](PsychicRequest *req) -> esp_err_t
             {
     String body = req->body();
@@ -737,5 +737,5 @@ void setup()
 
 void loop()
 {
-  vTaskDelay(pdMS_TO_TICKS(100)); // Prevent watchdog issues
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
