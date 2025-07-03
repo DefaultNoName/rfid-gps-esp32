@@ -18,7 +18,7 @@ const char *serverIP = "192.168.120.1";
 const int serverPort = 80;
 const char *uploadPath = "/upload";
 
-// Hardware pins for ESP8266 (NodeMCU/Wemos D1 Mini mapping)
+// Hardware pins for ESP8266 (NodeMCU/LoLin (and clones)/Wemos D1 Mini mapping)
 // RFID MFRC522 pins - Standard SPI connections
 #define SS_PIN 15 // D8 - GPIO15 (SS/CS pin for RFID)
 #define RST_PIN 0 // D3 - GPIO0 (RST pin for RFID)
@@ -28,6 +28,9 @@ const char *uploadPath = "/upload";
 #define GPS_RX_PIN 4 // D2 - GPIO4 (connect to GPS TX)
 #define GPS_TX_PIN 5 // D1 - GPIO5 (connect to GPS RX)
 
+// HC-05 Bluetooth Module pins - Using SoftwareSerial
+#define BT_RX_PIN 10 // S3 - GPIO 10
+#define BT_TX_PIN 9  // S2 - GPIO 9
 // LED indicators
 #define BUILTIN_LED_PIN 2 // GPIO2 (onboard LED - active LOW on ESP8266)
 #define RFID_LED_PIN 16   // D0 - GPIO16 (external LED indicator)
@@ -47,6 +50,7 @@ enum SystemState
 struct ComponentStatus
 {
   bool wifi_ok = false;
+  bool bt_ok = false;
   bool rfid_ok = false;
   bool gps_ok = false;
   bool http_ok = false;
@@ -345,14 +349,14 @@ void handleGPSReading()
 
       if (module_GPS.location.isValid())
       {
-        currentGPS_lat = String(module_GPS.location.lat(), 6);
-        currentGPS_lng = String(module_GPS.location.lng(), 6);
+        currentGPS_lat = String(module_GPS.location.lat(), 8);
+        currentGPS_lng = String(module_GPS.location.lng(), 8);
       }
 
-      currentGPS_alt = module_GPS.altitude.isValid() ? String(module_GPS.altitude.meters(), 1) : "N/A";
-      currentGPS_speed = module_GPS.speed.isValid() ? String(module_GPS.speed.kmph(), 1) : "N/A";
+      currentGPS_alt = module_GPS.altitude.isValid() ? String(module_GPS.altitude.meters(), 4) : "N/A";
+      currentGPS_speed = module_GPS.speed.isValid() ? String(module_GPS.speed.kmph(), 4) : "N/A";
       currentGPS_sats = module_GPS.satellites.isValid() ? String(module_GPS.satellites.value()) : "N/A";
-      currentGPS_hdop = module_GPS.hdop.isValid() ? String(module_GPS.hdop.hdop(), 2) : "N/A";
+      currentGPS_hdop = module_GPS.hdop.isValid() ? String(module_GPS.hdop.hdop(), 4) : "N/A";
     }
   }
 }
@@ -378,7 +382,7 @@ void handleHTTPTransmission()
 
   String url = String("http://") + serverIP + ":" + String(serverPort) + uploadPath;
 
-  http.begin(client, url); // Correct ESP8266HTTPClient syntax
+  http.begin(client, url); // ESP8266HTTPClient syntax
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(5000);
 
@@ -465,10 +469,10 @@ void handleRunningState()
 
 void setup()
 {
-  // ESP8266 doesn't have setCpuFrequencyMhz - use system_update_cpu_freq instead
-  system_update_cpu_freq(120); // 160MHz for ESP8266
-  Serial.begin(115200);
-  delay(1000);
+  system_update_cpu_freq(160); // 160MHz for ESP8266
+  esp_delay(1000);
+  Serial.begin(9600);
+  esp_delay(1000);
 
   // Initialize LED pins
   pinMode(BUILTIN_LED_PIN, OUTPUT);
