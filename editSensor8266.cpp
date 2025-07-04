@@ -334,7 +334,7 @@ void handleGPSReading()
 void handleRFIDReading()
 {
   static String lastscannedUID = "";
-  static unsigned long lastValidRead = 0; // Timer from last read
+  static unsigned long lastValidRead = 0; // Timer from last read for simple software debouncing
   unsigned int scanCount = 0;
 
   if (module_RFID.PICC_IsNewCardPresent() && module_RFID.PICC_ReadCardSerial())
@@ -359,7 +359,7 @@ void handleRFIDReading()
       scanCount++;                 // Increment scan count by 1
       module_RFID.PICC_HaltA();
       module_RFID.PCD_StopCrypto1();
-      Serial.println("New RFID Card/Tag. UID: + scannedUID");
+      Serial.println("New RFID Card/Tag. UID: " + scannedUID);
       // LED Indicators
       delay(1000);
       digitalWrite(BUILTIN_LED_PIN, HIGH); // Turn off LED (active LOW)
@@ -376,11 +376,21 @@ void handleRFIDReading()
       digitalWrite(BUILTIN_LED_PIN, HIGH); // Turn off LED (active LOW)
       digitalWrite(RFID_LED_PIN, LOW);     // Turn off external LED
     }
-    else if ((scannedUID != lastscannedUID) && (scanCount == 1) && ((millis() - lastValidRead) > 2000))
+    else if ((scannedUID != lastscannedUID) && (scanCount == 2) && ((millis() - lastValidRead) > 2000))
     {
-      Serial.println("Wrong RFID Card/Tag. UID: " + scannedUID);
+      Serial.println("Wrong RFID Card/Tag.");
       lastValidRead = millis(); // Reset timer
-      scanCount = 0;            // Reset scan counter
+      module_RFID.PICC_HaltA();
+      module_RFID.PCD_StopCrypto1();
+      // LED Indicators
+      delay(1000);
+      digitalWrite(BUILTIN_LED_PIN, HIGH); // Turn off LED (active LOW)
+      digitalWrite(RFID_LED_PIN, LOW);     // Turn off external LED
+    }
+    else
+    {
+      Serial.println("Wrong RFID Card/Tag.");
+      lastValidRead = millis(); // Reset timer
       module_RFID.PICC_HaltA();
       module_RFID.PCD_StopCrypto1();
       // LED Indicators
