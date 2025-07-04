@@ -332,18 +332,18 @@ void handleGPSReading()
     }
   }
 }
+
 void handleRFIDReading()
 {
-  static String lastscannedUID = "";      // Blank UID at startup
-  static unsigned long lastValidRead = 0; // Timer from last read for simple software debouncing
-  // unsigned long durationTimeOutIn = 0; //
-  unsigned int scanCount = 0; // Record/count RFID scans
+  static String lastscannedUID = ""; // Persistent storage
+  static int scanCount = 0;          // Track scan
+  bool isOnTravel = false;           // Track if someone is on a travel
+  unsigned long lastValidRead = 0;   // Timer for debouncing
 
   if (module_RFID.PICC_IsNewCardPresent() && module_RFID.PICC_ReadCardSerial())
   {
     digitalWrite(BUILTIN_LED_PIN, LOW); // Turn on LED (active LOW)
     digitalWrite(RFID_LED_PIN, HIGH);   // Turn on external LED
-
     String scannedUID = "";
     for (byte i = 0; i < module_RFID.uid.size; i++)
     {
@@ -352,69 +352,58 @@ void handleRFIDReading()
       scannedUID += String(module_RFID.uid.uidByte[i], HEX);
     }
     scannedUID.toUpperCase();
-
-    // Below is the logic for TIME OUT (going out the premises) and TIME IN (is back from, e.g. business travel)
-    // Also checks if it is the same RFID card or not
-    if ((lastscannedUID == "") && (scanCount == 0) && ((millis() - lastValidRead) > 2000))
+    // Debouncing check - ignore rapid repeated scans
+    if ((millis() - lastValidRead) < 2000)
     {
-      lastscannedUID = scannedUID; // Sets the last scanned UID with newly scanned UID
-      currentRFID = scannedUID;    // Also sets the current RFID UID with newly scanned UID
-      lastValidRead = millis();    // Reset timer for simple debounce?
-      scanCount++;                 // Increment scan count by 1
       module_RFID.PICC_HaltA();
       module_RFID.PCD_StopCrypto1();
-      Serial.println("New RFID Card/Tag. UID: " + scannedUID);
-      // Copy-paste condition from handleGPSReading functions
+      return;
+    }
+    // First scan ever or after a complete cycle
+    if ((lastscannedUID == "") || !isOnTravel)
+    {
+      lastscannedUID = scannedUID; // Sets the newly scanned UID as last scanned UID
+      currentRFID = scannedUID;    // Sets the newly scanned UID as the current UID
+      lastValidRead = millis();
+      isOnTravel = true; // Person is now "out"
+      // Record TIME OUT (now on a business travel)
       if (module_GPS.time.isValid())
       {
         char timeStr[12];
         snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
                  module_GPS.time.hour(), module_GPS.time.minute(), module_GPS.time.second());
-        time_out = String(timeStr); // Sets the time going out once
+        time_out = String(timeStr);
       }
-      /* Add logic duration counter here if GPS time is not available,
-        if now available, add current GPS time to recorded/counted duration
-
-      */
-
-      // LED Indicators
-      delay(1000);
-      digitalWrite(BUILTIN_LED_PIN, HIGH); // Turn off LED (active LOW)
-      digitalWrite(RFID_LED_PIN, LOW);     // Turn off external LED
+      Serial.println("Exit Time @ " + time_out);
     }
-    else if ((scannedUID == lastscannedUID) && (scanCount == 1) && ((millis() - lastValidRead) > 2000))
+    // Same card scanned while person is "out" - this is TIME IN (got back from business travel)
+    else if ((scannedUID == lastscannedUID) && isOnTravel)
     {
-      lastValidRead = millis(); // Reset timer
-      scanCount++;              // Increment scan count by 1 again
-      module_RFID.PICC_HaltA();
-      module_RFID.PCD_StopCrypto1();
-      Serial.println("Same RFID Card");
-
+      lastValidRead = millis();
+      scannedUID == "";
+      lastscannedUID == "";
+      isOnTravel = false; // Person is now "in"
+      // Record TIME IN
       if (module_GPS.time.isValid())
       {
         char timeStr[12];
         snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
                  module_GPS.time.hour(), module_GPS.time.minute(), module_GPS.time.second());
-        time_out = String(timeStr); // Sets the time going out once
+        time_in = String(timeStr);
       }
-      /* Stop duration counter here, and */
-
-      // LED Indicators
-      delay(1000);
-      digitalWrite(BUILTIN_LED_PIN, HIGH); // Turn off LED (active LOW)
-      digitalWrite(RFID_LED_PIN, LOW);     // Turn off external LED
+      Serial.println("Entry Time @ " + time_in);
     }
-    else if ((scannedUID != lastscannedUID) && (scanCount == (0 && 1)) && ((millis() - lastValidRead) > 2000))
+    // Different card scanned
+    else if ((scannedUID != lastscannedUID) && !isOnTravel)
     {
-      Serial.println("Wrong RFID Card/Tag.");
-      lastValidRead = millis(); // Reset timer
-      module_RFID.PICC_HaltA();
-      module_RFID.PCD_StopCrypto1();
-      // LED Indicators
-      delay(1000);
-      digitalWrite(BUILTIN_LED_PIN, HIGH); // Turn off LED (active LOW)
-      digitalWrite(RFID_LED_PIN, LOW);     // Turn off external LED
+      Serial.println("UNAUTHORIZED - Wrong RFID Card/Tag");
+      lastValidRead = millis();
+      // Don't change the state - unauthorized access
     }
+    // LED Indicators
+    delay(1000);
+    digitalWrite(BUILTIN_LED_PIN, HIGH); // Turn off LED (active LOW)
+    digitalWrite(RFID_LED_PIN, LOW);     // Turn off external LED
   }
 }
 
