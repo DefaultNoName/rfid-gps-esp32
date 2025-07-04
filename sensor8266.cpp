@@ -14,9 +14,13 @@
 // Wi-Fi credentials
 const char *SSID = "ESP32_AP";
 const char *PASSWORD = "01234567890";
-const char *serverIP = "192.168.120.1";
+const char *serverIP = "192.168.120.2";
 const int serverPort = 80;
 const char *uploadPath = "/upload";
+IPAddress sensorIP(192, 168, 120, 3); // Fixed IP for sensor
+IPAddress gateway(192, 168, 120, 1);  // ESP32-AP gateway
+IPAddress subnet(255, 255, 255, 0);   // Subnet mask
+IPAddress dns(192, 168, 120, 1);      // DNS
 
 // Hardware pins for ESP8266 (NodeMCU/LoLin (and clones)/Wemos D1 Mini mapping)
 // RFID MFRC522 pins - Standard SPI connections
@@ -85,6 +89,9 @@ const char *VEHICLE_PLATE = "UAM981";
 
 // Data storage
 String currentRFID = "N/A";
+String time_out = "N/A";
+String time_in = "N/A";
+String duration = "N/A";
 String currentGPS_time = "N/A";
 String currentGPS_lat = "N/A";
 String currentGPS_lng = "N/A";
@@ -117,7 +124,7 @@ void handleInitState()
     ESP.restart();
   }
 
-  // Initialize serial communication for GPS
+  // Initialize serial communication for GPS @ 9600 baud
   SerialGPS.begin(9600);
 
   // Move to WiFi connection state
@@ -138,6 +145,7 @@ void handleWifiConnecting()
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(false); // We'll handle reconnection manually
     WiFi.setSleepMode(WIFI_NONE_SLEEP);
+    WiFi.config(sensorIP, gateway, subnet, dns);
     WiFi.begin(SSID, PASSWORD);
     wifiStarted = true;
     Serial.print("Connecting");
@@ -159,10 +167,10 @@ void handleWifiConnecting()
       return;
     }
 
-    if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL)
+    if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL || status == WL_WRONG_PASSWORD)
     {
       Serial.printf("\nWiFi Connection Failed with Status: %d\n", status);
-      components.last_error = "WiFi authentication Failed";
+      components.last_error = "Can't connect to WiFi network, check WiFi config.";
       currentState = STATE_ERROR;
       return;
     }
@@ -175,7 +183,7 @@ void handleWifiConnecting()
     if (millis() > stateTimeout)
     {
       Serial.println("\nWiFi connection timeout");
-      components.last_error = "WiFi connection timeout";
+      components.last_error = "WiFi connection timeout.";
       currentState = STATE_ERROR;
       return;
     }
@@ -184,7 +192,7 @@ void handleWifiConnecting()
 
 void handleWifiConnected()
 {
-  Serial.println("WiFi connected, initializing hardware...");
+  Serial.println("WiFi connected, now initializing hardware...");
   currentState = STATE_HARDWARE_INIT;
   stateTimeout = millis() + 10000; // 10 second timeout for hardware initialize
 }
@@ -231,7 +239,7 @@ void handleHardwareInit()
     }
     catch (...)
     {
-      Serial.println("RFID initialization caused exception, disabling");
+      Serial.println("RFID initialization caused exception, now disabled.");
       components.rfid_ok = false;
     }
 
@@ -289,13 +297,13 @@ void handleHardwareInit()
 
 void handleErrorState()
 {
-  Serial.printf("System in error state: %s\n", components.last_error.c_str());
-  Serial.println("Restarting in 5 seconds...");
+  Serial.printf("System Error: %s\n", components.last_error.c_str());
+  Serial.println("WIll restart in 5 seconds...");
   delay(5000);
   ESP.restart();
 }
 
-// Simplified component handlers
+// Component handlers
 void handleRFIDReading()
 {
   static String lastUID = "";
@@ -315,7 +323,7 @@ void handleRFIDReading()
     }
     uid.toUpperCase();
 
-    // Simple debouncing
+    // Simple debouncing to avoid spam
     if (uid != lastUID || (millis() - lastValidRead) > 2000)
     {
       Serial.println("RFID: " + uid);
@@ -369,7 +377,9 @@ void handleHTTPTransmission()
   doc["model"] = VEHICLE_MODEL;
   doc["pltNum"] = VEHICLE_PLATE;
   doc["uid"] = currentRFID;
-  doc["time"] = currentGPS_time;
+  doc["time_out"] = time_out;
+  doc["time_in"] = time_in;
+  doc["gps_time"] = currentGPS_time;
   doc["lat"] = currentGPS_lat;
   doc["long"] = currentGPS_lng;
   doc["alt"] = currentGPS_alt;
@@ -427,7 +437,7 @@ void handleRunningState()
   unsigned long currentTime = millis();
 
   // Check WiFi status
-  if (WiFi.status() != WL_CONNECTED)
+  if (WiFi.status() != WL_CONNECTED && WiFi.status() == WL_DISCONNECTED)
   {
     Serial.println("WiFi disconnected, returning to connection state");
     components.wifi_ok = false;
