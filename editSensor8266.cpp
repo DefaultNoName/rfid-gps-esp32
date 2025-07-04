@@ -1,6 +1,7 @@
 // Proof-of-Concept Project - ESP8266 Port
 
 #include <Arduino.h>
+#include <core_esp8266_features.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <MFRC522v2.h>
@@ -333,9 +334,10 @@ void handleGPSReading()
 }
 void handleRFIDReading()
 {
-  static String lastscannedUID = "";
+  static String lastscannedUID = "";      // Blank UID at startup
   static unsigned long lastValidRead = 0; // Timer from last read for simple software debouncing
-  unsigned int scanCount = 0;
+  // unsigned long durationTimeOutIn = 0; //
+  unsigned int scanCount = 0; // Record/count RFID scans
 
   if (module_RFID.PICC_IsNewCardPresent() && module_RFID.PICC_ReadCardSerial())
   {
@@ -351,15 +353,30 @@ void handleRFIDReading()
     }
     scannedUID.toUpperCase();
 
+    // Below is the logic for TIME OUT (going out the premises) and TIME IN (is back from, e.g. business travel)
+    // Also checks if it is the same RFID card or not
     if ((lastscannedUID == "") && (scanCount == 0) && ((millis() - lastValidRead) > 2000))
     {
       lastscannedUID = scannedUID; // Sets the last scanned UID with newly scanned UID
       currentRFID = scannedUID;    // Also sets the current RFID UID with newly scanned UID
-      lastValidRead = millis();    // Reset timer
+      lastValidRead = millis();    // Reset timer for simple debounce?
       scanCount++;                 // Increment scan count by 1
       module_RFID.PICC_HaltA();
       module_RFID.PCD_StopCrypto1();
       Serial.println("New RFID Card/Tag. UID: " + scannedUID);
+      // Copy-paste condition from handleGPSReading functions
+      if (module_GPS.time.isValid())
+      {
+        char timeStr[12];
+        snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
+                 module_GPS.time.hour(), module_GPS.time.minute(), module_GPS.time.second());
+        time_out = String(timeStr); // Sets the time going out once
+      }
+      /* Add logic duration counter here if GPS time is not available,
+        if now available, add current GPS time to recorded/counted duration
+
+      */
+
       // LED Indicators
       delay(1000);
       digitalWrite(BUILTIN_LED_PIN, HIGH); // Turn off LED (active LOW)
@@ -371,23 +388,23 @@ void handleRFIDReading()
       scanCount++;              // Increment scan count by 1 again
       module_RFID.PICC_HaltA();
       module_RFID.PCD_StopCrypto1();
+      Serial.println("Same RFID Card");
+
+      if (module_GPS.time.isValid())
+      {
+        char timeStr[12];
+        snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
+                 module_GPS.time.hour(), module_GPS.time.minute(), module_GPS.time.second());
+        time_out = String(timeStr); // Sets the time going out once
+      }
+      /* Stop duration counter here, and */
+
       // LED Indicators
       delay(1000);
       digitalWrite(BUILTIN_LED_PIN, HIGH); // Turn off LED (active LOW)
       digitalWrite(RFID_LED_PIN, LOW);     // Turn off external LED
     }
-    else if ((scannedUID != lastscannedUID) && (scanCount == 2) && ((millis() - lastValidRead) > 2000))
-    {
-      Serial.println("Wrong RFID Card/Tag.");
-      lastValidRead = millis(); // Reset timer
-      module_RFID.PICC_HaltA();
-      module_RFID.PCD_StopCrypto1();
-      // LED Indicators
-      delay(1000);
-      digitalWrite(BUILTIN_LED_PIN, HIGH); // Turn off LED (active LOW)
-      digitalWrite(RFID_LED_PIN, LOW);     // Turn off external LED
-    }
-    else
+    else if ((scannedUID != lastscannedUID) && (scanCount == (0 && 1)) && ((millis() - lastValidRead) > 2000))
     {
       Serial.println("Wrong RFID Card/Tag.");
       lastValidRead = millis(); // Reset timer
