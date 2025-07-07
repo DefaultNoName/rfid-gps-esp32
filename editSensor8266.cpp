@@ -13,15 +13,15 @@
 #include <ArduinoJson.h>
 
 // Wi-Fi credentials
-const char *SSID = "ESP32_AP";
-const char *PASSWORD = "01234567890";
-const char *serverIP = "192.168.120.2";
-const int serverPort = 80;
-const char *uploadPath = "/upload";
-IPAddress sensorIP(192, 168, 120, 3); // Fixed IP for sensor
-IPAddress gateway(192, 168, 120, 1);  // ESP32-AP gateway
-IPAddress subnet(255, 255, 255, 0);   // Subnet mask
-IPAddress dns(192, 168, 120, 1);      // DNS
+const char *ssid = "ESP32_AP";
+const char *password = "01234567890";
+const char *server_ip = "192.168.120.2";
+const int server_port = 80;
+const char *upload_path = "/upload";
+IPAddress sensor_ip(192, 168, 120, 3); // Fixed IP for sensor
+IPAddress gateway(192, 168, 120, 1);   // ESP32-AP gateway
+IPAddress subnet(255, 255, 255, 0);    // Subnet mask
+IPAddress dns(192, 168, 120, 1);       // DNS
 
 // Hardware pins for ESP8266 (NodeMCU/LoLin (and clones)/Wemos D1 Mini mapping)
 // RFID MFRC522 pins - Standard SPI connections
@@ -41,7 +41,7 @@ IPAddress dns(192, 168, 120, 1);      // DNS
 #define RFID_LED_PIN 16   // D0 - GPIO16 (external LED indicator)
 
 // System States for Pseudo-Multitasking
-enum SystemState
+enum system_state_t
 {
   STATE_INIT,
   STATE_WIFI_CONNECTING,
@@ -52,7 +52,7 @@ enum SystemState
 };
 
 // Component status tracking
-struct ComponentStatus
+struct component_status_t
 {
   bool wifi_ok = false;
   bool bt_ok = false;
@@ -63,56 +63,56 @@ struct ComponentStatus
 };
 
 // Global variables
-SystemState currentState = STATE_INIT;
-ComponentStatus components;
+system_state_t current_state = STATE_INIT;
+component_status_t components;
 WiFiClient client;
 HTTPClient http;
 
 // Hardware variables - Fixed pin assignments
 MFRC522DriverPinSimple ss_pin(SS_PIN);
 MFRC522DriverSPI driver{ss_pin};
-MFRC522 module_RFID{driver};
-TinyGPSPlus module_GPS;
-SoftwareSerial SerialGPS(GPS_RX_PIN, GPS_TX_PIN);
+MFRC522 module_rfid{driver};
+TinyGPSPlus module_gps;
+SoftwareSerial serial_gps(GPS_RX_PIN, GPS_TX_PIN);
 
 // Timing variables
-unsigned long lastWifiAttempt = 0;
-unsigned long lastRFIDRead = 0;
-unsigned long lastGPSUpdate = 0;
-unsigned long lastHTTPSend = 0;
-unsigned long lastHealthCheck = 0;
-unsigned long stateTimeout = 0;
+unsigned long last_wifi_attempt = 0;
+unsigned long last_rfid_read = 0;
+unsigned long last_gps_update = 0;
+unsigned long last_http_send = 0;
+unsigned long last_health_check = 0;
+unsigned long state_timeout = 0;
 
 // Vehicle constants
-const char *VEHICLE_BRAND = "Toyota";
-const char *VEHICLE_MODEL = "Tamaraw FX";
-const char *VEHICLE_PLATE = "UAM981";
+const char *vehicle_brand = "Toyota";
+const char *vehicle_model = "Tamaraw FX";
+const char *vehicle_plate = "UAM981";
 
 // Data storage
-String currentRFID = "N/A";
-String time_out = "N/A";
-String time_in = "N/A";
+String current_rfid = "N/A";
+String time_exit = "N/A";
+String time_entry = "N/A";
 String duration = "N/A";
-String currentGPS_time = "N/A";
-String currentGPS_lat = "N/A";
-String currentGPS_lng = "N/A";
-String currentGPS_alt = "N/A";
-String currentGPS_speed = "N/A";
-String currentGPS_sats = "N/A";
-String currentGPS_hdop = "N/A";
+String current_gps_time = "N/A";
+String current_gps_lat = "N/A";
+String current_gps_lng = "N/A";
+String current_gps_alt = "N/A";
+String current_gps_speed = "N/A";
+String current_gps_sats = "N/A";
+String current_gps_hdop = "N/A";
 
 // Fixed MAC address retrieval for ESP8266
-String getPHYS_ADDR()
+String get_phys_addr()
 {
   String mac = WiFi.macAddress();
   mac.replace(":", ""); // Remove colons to match format
   return mac;
 }
-const String PHYS_ADDR_STR = getPHYS_ADDR();
-const char *PHYS_ADDR = PHYS_ADDR_STR.c_str(); // Device UUID
+const String phys_addr_str = get_phys_addr();
+const char *phys_addr = phys_addr_str.c_str(); // Device UUID
 
 // State machine functions
-void handleInitState()
+void handle_init_state()
 {
   Serial.println("=== System Initialization ===");
   Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
@@ -126,35 +126,35 @@ void handleInitState()
   }
 
   // Initialize serial communication for GPS @ 9600 baud
-  SerialGPS.begin(9600);
+  serial_gps.begin(9600);
 
   // Move to WiFi connection state
-  currentState = STATE_WIFI_CONNECTING;
-  lastWifiAttempt = millis();
-  stateTimeout = millis() + 30000; // 30 second timeout
+  current_state = STATE_WIFI_CONNECTING;
+  last_wifi_attempt = millis();
+  state_timeout = millis() + 30000; // 30 second timeout
   Serial.println("Moving to WiFi connection state");
 }
 
-void handleWifiConnecting()
+void handle_wifi_connecting()
 {
-  static bool wifiStarted = false;
-  static int wifiAttempts = 0;
+  static bool wifi_started = false;
+  static int wifi_attempts = 0;
 
-  if (!wifiStarted)
+  if (!wifi_started)
   {
     Serial.println("Starting WiFi Connection...");
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(false); // We'll handle reconnection manually
     WiFi.setSleepMode(WIFI_NONE_SLEEP);
-    WiFi.config(sensorIP, gateway, subnet, dns);
-    WiFi.begin(SSID, PASSWORD);
-    wifiStarted = true;
+    WiFi.config(sensor_ip, gateway, subnet, dns);
+    WiFi.begin(ssid, password);
+    wifi_started = true;
     Serial.print("Connecting");
     return;
   }
 
   // Check WiFi status every 500ms
-  if (millis() - lastWifiAttempt > 500)
+  if (millis() - last_wifi_attempt > 500)
   {
     wl_status_t status = WiFi.status();
 
@@ -164,7 +164,7 @@ void handleWifiConnecting()
       Serial.printf("WiFi Connected! IP: %s, Signal: %d dBm\n",
                     WiFi.localIP().toString().c_str(), WiFi.RSSI());
       components.wifi_ok = true;
-      currentState = STATE_WIFI_CONNECTED;
+      current_state = STATE_WIFI_CONNECTED;
       return;
     }
 
@@ -172,60 +172,60 @@ void handleWifiConnecting()
     {
       Serial.printf("\nWiFi Connection Failed with Status: %d\n", status);
       components.last_error = "Can't connect to WiFi network, check WiFi config.";
-      currentState = STATE_ERROR;
+      current_state = STATE_ERROR;
       return;
     }
 
     Serial.print(".");
-    lastWifiAttempt = millis();
-    wifiAttempts++;
+    last_wifi_attempt = millis();
+    wifi_attempts++;
 
     // Timeout check
-    if (millis() > stateTimeout)
+    if (millis() > state_timeout)
     {
       Serial.println("\nWiFi connection timeout");
       components.last_error = "WiFi connection timeout.";
-      currentState = STATE_ERROR;
+      current_state = STATE_ERROR;
       return;
     }
   }
 }
 
-void handleWifiConnected()
+void handle_wifi_connected()
 {
   Serial.println("WiFi connected, now initializing hardware...");
-  currentState = STATE_HARDWARE_INIT;
-  stateTimeout = millis() + 10000; // 10 second timeout for hardware initialize
+  current_state = STATE_HARDWARE_INIT;
+  state_timeout = millis() + 10000; // 10 second timeout for hardware initialize
 }
 
-void handleHardwareInit()
+void handle_hardware_init()
 {
-  static bool spiInitialized = false;
-  static bool rfidTested = false;
-  static bool gpsTested = false;
+  static bool spi_initialized = false;
+  static bool rfid_tested = false;
+  static bool gps_tested = false;
 
   // Initialize SPI once
-  if (!spiInitialized)
+  if (!spi_initialized)
   {
     Serial.println("Initializing SPI...");
     SPI.begin();
     delay(100);
-    spiInitialized = true;
+    spi_initialized = true;
     Serial.printf("SPI initialized. Free heap: %d\n", ESP.getFreeHeap());
     return;
   }
 
   // Test RFID
-  if (!rfidTested)
+  if (!rfid_tested)
   {
     Serial.println("Testing RFID module...");
 
     // Simple test - Initialize without complex operations
     try
     {
-      module_RFID.PCD_Init();
+      module_rfid.PCD_Init();
       delay(100);
-      byte version = module_RFID.PCD_GetVersion();
+      byte version = module_rfid.PCD_GetVersion();
 
       if (version != 0x00 && version != 0xFF)
       {
@@ -244,32 +244,32 @@ void handleHardwareInit()
       components.rfid_ok = false;
     }
 
-    rfidTested = true;
+    rfid_tested = true;
     Serial.printf("After RFID test. Free heap: %d\n", ESP.getFreeHeap());
     return;
   }
 
   // Test GPS - just check if data is available
-  if (!gpsTested)
+  if (!gps_tested)
   {
     Serial.println("Testing GPS module...");
 
-    unsigned long startTime = millis();
-    bool gpsDataSeen = false;
+    unsigned long start_time = millis();
+    bool gps_data_seen = false;
 
     // Quick test - just look for any data for 2 seconds
-    while (millis() - startTime < 2000)
+    while (millis() - start_time < 2000)
     {
-      if (SerialGPS.available())
+      if (serial_gps.available())
       {
-        SerialGPS.read(); // Just consume the data
-        gpsDataSeen = true;
+        serial_gps.read(); // Just consume the data
+        gps_data_seen = true;
         break;
       }
       delay(10);
     }
 
-    if (gpsDataSeen)
+    if (gps_data_seen)
     {
       Serial.println("GPS data detected");
       components.gps_ok = true;
@@ -280,7 +280,7 @@ void handleHardwareInit()
       components.gps_ok = false;
     }
 
-    gpsTested = true;
+    gps_tested = true;
     Serial.printf("After GPS test. Free heap: %d\n", ESP.getFreeHeap());
     return;
   }
@@ -293,10 +293,10 @@ void handleHardwareInit()
                 components.gps_ok ? "OK" : "FAIL");
 
   components.http_ok = true; // HTTP is always available if WiFi works
-  currentState = STATE_RUNNING;
+  current_state = STATE_RUNNING;
 }
 
-void handleErrorState()
+void handle_error_state()
 {
   Serial.printf("System Error: %s\n", components.last_error.c_str());
   Serial.println("WIll restart in 5 seconds...");
@@ -305,101 +305,136 @@ void handleErrorState()
 }
 
 // Component handlers
-void handleGPSReading()
+void handle_gps_reading()
 {
-  while (SerialGPS.available())
+  while (serial_gps.available())
   {
-    if (module_GPS.encode(SerialGPS.read()))
+    if (module_gps.encode(serial_gps.read()))
     {
-      if (module_GPS.time.isValid())
+      if (module_gps.time.isValid())
       {
-        char timeStr[12];
-        snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
-                 module_GPS.time.hour(), module_GPS.time.minute(), module_GPS.time.second());
-        currentGPS_time = String(timeStr);
+        char time_str[12];
+        snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d",
+                 module_gps.time.hour(), module_gps.time.minute(), module_gps.time.second());
+        current_gps_time = String(time_str);
       }
 
-      if (module_GPS.location.isValid())
+      if (module_gps.location.isValid())
       {
-        currentGPS_lat = String(module_GPS.location.lat(), 8);
-        currentGPS_lng = String(module_GPS.location.lng(), 8);
+        current_gps_lat = String(module_gps.location.lat(), 8);
+        current_gps_lng = String(module_gps.location.lng(), 8);
       }
 
-      currentGPS_alt = module_GPS.altitude.isValid() ? String(module_GPS.altitude.meters(), 4) : "N/A";
-      currentGPS_speed = module_GPS.speed.isValid() ? String(module_GPS.speed.kmph(), 4) : "N/A";
-      currentGPS_sats = module_GPS.satellites.isValid() ? String(module_GPS.satellites.value()) : "N/A";
-      currentGPS_hdop = module_GPS.hdop.isValid() ? String(module_GPS.hdop.hdop(), 4) : "N/A";
+      current_gps_alt = module_gps.altitude.isValid() ? String(module_gps.altitude.meters(), 4) : "N/A";
+      current_gps_speed = module_gps.speed.isValid() ? String(module_gps.speed.kmph(), 4) : "N/A";
+      current_gps_sats = module_gps.satellites.isValid() ? String(module_gps.satellites.value()) : "N/A";
+      current_gps_hdop = module_gps.hdop.isValid() ? String(module_gps.hdop.hdop(), 4) : "N/A";
     }
   }
 }
 
-void handleRFIDReading()
+void handle_rfid_reading()
 {
-  static String lastscannedUID = ""; // Persistent storage
-  static int scanCount = 0;          // Track scan
-  bool isOnTravel = false;           // Track if someone is on a travel
-  unsigned long lastValidRead = 0;   // Timer for debouncing
+  static String last_scanned_uid = ""; // Persistent storage for UID
+  static uint8_t last_valid_read = 0;  // Timer for debouncing
+  static bool is_on_travel = false;    // Track if someone is on a travel
+  static uint32_t start_time_exit = 0; // Start timer
+  static uint32_t end_time_entry = 0;  // End Timer
+  static uint32_t duration = 0;
+  static uint32_t seconds = 0, minutes = 0, hours = 0;
 
-  if (module_RFID.PICC_IsNewCardPresent() && module_RFID.PICC_ReadCardSerial())
+  if (module_rfid.PICC_IsNewCardPresent() && module_rfid.PICC_ReadCardSerial())
   {
     digitalWrite(BUILTIN_LED_PIN, LOW); // Turn on LED (active LOW)
     digitalWrite(RFID_LED_PIN, HIGH);   // Turn on external LED
-    String scannedUID = "";
-    for (byte i = 0; i < module_RFID.uid.size; i++)
+
+    String scanned_uid = "";
+    for (byte i = 0; i < module_rfid.uid.size; i++)
     {
-      if (module_RFID.uid.uidByte[i] < 0x10)
-        scannedUID += "0";
-      scannedUID += String(module_RFID.uid.uidByte[i], HEX);
+      if (module_rfid.uid.uidByte[i] < 0x10)
+        scanned_uid += "0";
+      scanned_uid += String(module_rfid.uid.uidByte[i], HEX);
     }
-    scannedUID.toUpperCase();
+    scanned_uid.toUpperCase();
+
     // Debouncing check - ignore rapid repeated scans
-    if ((millis() - lastValidRead) < 2000)
+    if ((millis() - last_valid_read) < 2000)
     {
-      module_RFID.PICC_HaltA();
-      module_RFID.PCD_StopCrypto1();
+      module_rfid.PICC_HaltA();
+      module_rfid.PCD_StopCrypto1();
+      digitalWrite(BUILTIN_LED_PIN, HIGH);
+      digitalWrite(RFID_LED_PIN, LOW);
       return;
     }
-    // First scan ever or after a complete cycle
-    if ((lastscannedUID == "") || !isOnTravel)
+
+    // First scan ever or after person returned (TIME OUT/EXIT)
+    if ((last_scanned_uid == "") || !is_on_travel)
     {
-      lastscannedUID = scannedUID; // Sets the newly scanned UID as last scanned UID
-      currentRFID = scannedUID;    // Sets the newly scanned UID as the current UID
-      lastValidRead = millis();
-      isOnTravel = true; // Person is now "out"
-      // Record TIME OUT (now on a business travel)
-      if (module_GPS.time.isValid())
+      last_scanned_uid = scanned_uid; // Sets the newly scanned UID as last scanned UID
+      current_rfid = scanned_uid;     // Sets the newly scanned UID as the current UID
+      last_valid_read = millis();
+      is_on_travel = true; // Person is now "out"
+
+      // Record TIME OUT (now on a travel)
+      if (module_gps.time.isValid() && module_gps.time.isUpdated())
       {
-        char timeStr[12];
-        snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
-                 module_GPS.time.hour(), module_GPS.time.minute(), module_GPS.time.second());
-        time_out = String(timeStr);
+        char time_str[12];
+        snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d",
+                 module_gps.time.hour(), module_gps.time.minute(), module_gps.time.second());
+        time_exit = String(time_str);
+        Serial.println("EXIT TIME @ " + time_exit + " - UID: " + scanned_uid);
       }
-      Serial.println("Exit Time @ " + time_out);
+      else
+      {
+        Serial.println("Timer started");
+        end_time_entry = millis(); // Start timer
+      }
     }
-    // Same card scanned while person is "out" - this is TIME IN (got back from business travel)
-    else if ((scannedUID == lastscannedUID) && isOnTravel)
+    // Same card scanned while person is "out" (TIME IN/EXIT)
+    else if ((scanned_uid == last_scanned_uid) && is_on_travel)
     {
-      lastValidRead = millis();
-      scannedUID == "";
-      lastscannedUID == "";
-      isOnTravel = false; // Person is now "in"
+      last_valid_read = millis();
+      is_on_travel = false; // Person is now "in"
+
       // Record TIME IN
-      if (module_GPS.time.isValid())
+      if (module_gps.time.isValid() && module_gps.time.isUpdated())
       {
-        char timeStr[12];
-        snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
-                 module_GPS.time.hour(), module_GPS.time.minute(), module_GPS.time.second());
-        time_in = String(timeStr);
+        char time_str[12];
+        snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d",
+                 module_gps.time.hour(), module_gps.time.minute(), module_gps.time.second());
+        time_entry = String(time_str);
+        Serial.println("ENTRY TIME @ " + time_entry + " - UID: " + scanned_uid);
       }
-      Serial.println("Entry Time @ " + time_in);
+      else
+      {
+        duration = (end_time_entry - start_time_exit);
+        hours = duration / 3600000;
+        minutes = (duration % 3600000) / 60000;
+        seconds = (duration % 60000) / 1000;
+        Serial.printf("Timer ended | Duration: %d:%d:%d\n",
+                      hours,
+                      minutes,
+                      seconds);
+      }
     }
-    // Different card scanned
-    else if ((scannedUID != lastscannedUID) && !isOnTravel)
+    // Different card scanned while authorized person is out
+    else if ((scanned_uid != last_scanned_uid) && is_on_travel)
     {
-      Serial.println("UNAUTHORIZED - Wrong RFID Card/Tag");
-      lastValidRead = millis();
+      Serial.println("UNAUTHORIZED - Wrong RFID Card/Tag. Expected: " + last_scanned_uid + ", Got: " + scanned_uid);
+      last_valid_read = millis();
       // Don't change the state - unauthorized access
     }
+    // Different card scanned while no one is out (shouldn't happen with current logic)
+    else if ((scanned_uid != last_scanned_uid) && !is_on_travel)
+    {
+      Serial.println("UNAUTHORIZED - Wrong RFID Card/Tag. UID: " + scanned_uid);
+      last_valid_read = millis();
+    }
+
+    // Clean up RFID module
+    module_rfid.PICC_HaltA();
+    module_rfid.PCD_StopCrypto1();
+
     // LED Indicators
     delay(1000);
     digitalWrite(BUILTIN_LED_PIN, HIGH); // Turn off LED (active LOW)
@@ -407,51 +442,51 @@ void handleRFIDReading()
   }
 }
 
-void handleHTTPTransmission()
+void handle_http_transmission()
 {
   JsonDocument doc;
-  doc["phys_addr"] = PHYS_ADDR;
-  doc["brand"] = VEHICLE_BRAND;
-  doc["model"] = VEHICLE_MODEL;
-  doc["pltNum"] = VEHICLE_PLATE;
-  doc["uid"] = currentRFID;
-  doc["time_out"] = time_out;
-  doc["time_in"] = time_in;
-  doc["gps_time"] = currentGPS_time;
-  doc["lat"] = currentGPS_lat;
-  doc["long"] = currentGPS_lng;
-  doc["alt"] = currentGPS_alt;
-  doc["spd"] = currentGPS_speed;
-  doc["sat"] = currentGPS_sats;
-  doc["hdop"] = currentGPS_hdop;
+  doc["phys_addr"] = phys_addr;
+  doc["brand"] = vehicle_brand;
+  doc["model"] = vehicle_model;
+  doc["pltNum"] = vehicle_plate;
+  doc["uid"] = current_rfid;
+  doc["time_EXIT"] = time_exit;
+  doc["time_ENTRY"] = time_entry;
+  doc["GPS_time"] = current_gps_time;
+  doc["lat"] = current_gps_lat;
+  doc["long"] = current_gps_lng;
+  doc["alt"] = current_gps_alt;
+  doc["spd"] = current_gps_speed;
+  doc["sat"] = current_gps_sats;
+  doc["hdop"] = current_gps_hdop;
 
   String json;
   serializeJson(doc, json);
 
-  String url = String("http://") + serverIP + ":" + String(serverPort) + uploadPath;
+  String url = String("http://") + server_ip + ":" + String(server_port) + upload_path;
 
   http.begin(client, url); // ESP8266HTTPClient syntax
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(5000);
 
-  int httpResponseCode = http.POST(json);
-  if (httpResponseCode == 200)
+  int http_response_code = http.POST(json);
+  if (http_response_code == 200)
   {
     // Success - no need to log every successful transmission
   }
-  else if (httpResponseCode > 0)
+  else if (http_response_code > 0)
   {
-    Serial.printf("HTTP Error %d\n", httpResponseCode);
+    Serial.printf("HTTP Error %d\n", http_response_code);
   }
   else
   {
-    Serial.printf("HTTP Connection Error: %d\n", httpResponseCode);
+    Serial.printf("HTTP Connection Error: %d\n", http_response_code);
   }
 
   http.end();
 }
 
-void handleHealthCheck()
+void handle_health_check()
 {
   Serial.printf("Health: Heap=%d, WiFi=%s (%ddBm), RFID=%s, GPS=%s, HTTP=%s\n",
                 ESP.getFreeHeap(),
@@ -470,9 +505,9 @@ void handleHealthCheck()
   }
 }
 
-void handleRunningState()
+void handle_running_state()
 {
-  unsigned long currentTime = millis();
+  unsigned long current_time = millis();
 
   // Check WiFi status
   if (WiFi.status() != WL_CONNECTED && WiFi.status() == WL_DISCONNECTED)
@@ -480,38 +515,38 @@ void handleRunningState()
     Serial.println("WiFi disconnected, returning to connection state");
     components.wifi_ok = false;
     components.http_ok = false;
-    currentState = STATE_WIFI_CONNECTING;
-    lastWifiAttempt = 0;
-    stateTimeout = millis() + 30000;
+    current_state = STATE_WIFI_CONNECTING;
+    last_wifi_attempt = 0;
+    state_timeout = millis() + 30000;
     return;
   }
 
   // Handle RFID reading
-  if (components.rfid_ok && currentTime - lastRFIDRead > 100)
+  if (components.rfid_ok && current_time - last_rfid_read > 100)
   {
-    handleRFIDReading();
-    lastRFIDRead = currentTime;
+    handle_rfid_reading();
+    last_rfid_read = current_time;
   }
 
   // Handle GPS reading
-  if (components.gps_ok && currentTime - lastGPSUpdate > 1000)
+  if (components.gps_ok && current_time - last_gps_update > 1000)
   {
-    handleGPSReading();
-    lastGPSUpdate = currentTime;
+    handle_gps_reading();
+    last_gps_update = current_time;
   }
 
   // Handle HTTP transmission
-  if (components.http_ok && currentTime - lastHTTPSend > 5000)
+  if (components.http_ok && current_time - last_http_send > 5000)
   {
-    handleHTTPTransmission();
-    lastHTTPSend = currentTime;
+    handle_http_transmission();
+    last_http_send = current_time;
   }
 
   // Health check
-  if (currentTime - lastHealthCheck > 15000)
+  if (current_time - last_health_check > 15000)
   {
-    handleHealthCheck();
-    lastHealthCheck = currentTime;
+    handle_health_check();
+    last_health_check = current_time;
   }
 }
 
@@ -529,34 +564,34 @@ void setup()
   digitalWrite(RFID_LED_PIN, LOW);     // Turn off external LED
 
   Serial.println("=== ESP8266 RFID-GPS System ===");
-  Serial.println("Device UUID: " + PHYS_ADDR_STR);
+  Serial.println("Device UUID: " + phys_addr_str);
 
   // Start with initialization state
-  currentState = STATE_INIT;
+  current_state = STATE_INIT;
 }
 
 void loop()
 {
   // State Machine Execution
-  switch (currentState)
+  switch (current_state)
   {
   case STATE_INIT:
-    handleInitState();
+    handle_init_state();
     break;
   case STATE_WIFI_CONNECTING:
-    handleWifiConnecting();
+    handle_wifi_connecting();
     break;
   case STATE_WIFI_CONNECTED:
-    handleWifiConnected();
+    handle_wifi_connected();
     break;
   case STATE_HARDWARE_INIT:
-    handleHardwareInit();
+    handle_hardware_init();
     break;
   case STATE_RUNNING:
-    handleRunningState();
+    handle_running_state();
     break;
   case STATE_ERROR:
-    handleErrorState();
+    handle_error_state();
     break;
   }
 
