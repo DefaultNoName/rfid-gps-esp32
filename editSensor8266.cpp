@@ -1,6 +1,6 @@
 // Proof-of-Concept Project - ESP8266 Port
 
-#include <Arduino.h>
+//#include <Arduino.h>
 #include <core_esp8266_features.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
@@ -371,6 +371,7 @@ void handle_gps_reading()
       current_gps_hdop = module_gps.hdop.isValid() ? String(module_gps.hdop.hdop(), 4) : "N/A";
     }
   }
+  time_from_gps_converted_to_seconds = total_in_seconds; // Store time data in global variable, might use
 }
 
 void handle_rfid_reading()
@@ -520,6 +521,7 @@ void handle_rfid_reading()
       {
         // Logic haven't figured how
         // should i copy-paste the logic for time calculation just like in handle_gps_reading and set it as the "time_exit"
+        // or use the time_from_gps_converted_to_seconds 
       }
 
       exit_time_valid = true; // Update the boolean flag if success
@@ -532,7 +534,7 @@ void handle_rfid_reading()
       (e.g. no data coming from GPS module itself or skies are blocked)
 
       is block below correct? 
-      
+
       end_time_to_entry_in_ms = millis();
       computed_duration_in_ms = (end_time_to_entry_in_ms - start_time_to_exit_in_ms);
       hours = (computed_duration_in_ms / 3600000);
