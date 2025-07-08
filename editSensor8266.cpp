@@ -50,6 +50,14 @@ enum system_state_t
   STATE_RUNNING,
   STATE_ERROR
 };
+// States for Time Validity of EXIT/ENTRY
+enum time_states
+{
+  STATE_EXIT_TIME_VALID,
+  STATE_EXIT_TIME_INVALID,
+  STATE_ENTRY_TIME_VALID,
+  STATE_ENTRY_TIME_INVALID
+};
 
 // Component status tracking
 struct component_status_t
@@ -63,7 +71,8 @@ struct component_status_t
 };
 
 // Global variables
-system_state_t current_state = STATE_INIT;
+system_state_t current_system_state = STATE_INIT;
+time_states current_time_state = STATE_EXIT_TIME_VALID;
 component_status_t components;
 WiFiClient client;
 HTTPClient http;
@@ -101,6 +110,9 @@ String current_gps_speed = "N/A";
 String current_gps_sats = "N/A";
 String current_gps_hdop = "N/A";
 
+// Global Time Storage
+static uint32_t time_from_gps_converted_to_seconds = 0;
+
 // Fixed MAC address retrieval for ESP8266
 String get_phys_addr()
 {
@@ -129,7 +141,7 @@ void handle_init_state()
   serial_gps.begin(9600);
 
   // Move to WiFi connection state
-  current_state = STATE_WIFI_CONNECTING;
+  current_system_state = STATE_WIFI_CONNECTING;
   last_wifi_attempt = millis();
   state_timeout = millis() + 30000; // 30 second timeout
   Serial.println("Moving to WiFi connection state");
@@ -164,7 +176,7 @@ void handle_wifi_connecting()
       Serial.printf("WiFi Connected! IP: %s, Signal: %d dBm\n",
                     WiFi.localIP().toString().c_str(), WiFi.RSSI());
       components.wifi_ok = true;
-      current_state = STATE_WIFI_CONNECTED;
+      current_system_state = STATE_WIFI_CONNECTED;
       return;
     }
 
@@ -172,7 +184,7 @@ void handle_wifi_connecting()
     {
       Serial.printf("\nWiFi Connection Failed with Status: %d\n", status);
       components.last_error = "Can't connect to WiFi network, check WiFi config.";
-      current_state = STATE_ERROR;
+      current_system_state = STATE_ERROR;
       return;
     }
 
@@ -185,7 +197,7 @@ void handle_wifi_connecting()
     {
       Serial.println("\nWiFi connection timeout");
       components.last_error = "WiFi connection timeout.";
-      current_state = STATE_ERROR;
+      current_system_state = STATE_ERROR;
       return;
     }
   }
@@ -193,8 +205,8 @@ void handle_wifi_connecting()
 
 void handle_wifi_connected()
 {
-  Serial.println("WiFi connected, now initializing hardware...");
-  current_state = STATE_HARDWARE_INIT;
+  Serial.println("Initializing hardware...");
+  current_system_state = STATE_HARDWARE_INIT;
   state_timeout = millis() + 10000; // 10 second timeout for hardware initialize
 }
 
@@ -293,13 +305,13 @@ void handle_hardware_init()
                 components.gps_ok ? "OK" : "FAIL");
 
   components.http_ok = true; // HTTP is always available if WiFi works
-  current_state = STATE_RUNNING;
+  current_system_state = STATE_RUNNING;
 }
 
 void handle_error_state()
 {
   Serial.printf("System Error: %s\n", components.last_error.c_str());
-  Serial.println("WIll restart in 5 seconds...");
+  Serial.println("Will restart in 5 seconds...");
   delay(5000);
   ESP.restart();
 }
@@ -307,16 +319,44 @@ void handle_error_state()
 // Component handlers
 void handle_gps_reading()
 {
+  // Local storage for time
+  static uint16_t hours_from_gps_data = 0;
+  static uint16_t minutes_from_gps_data = 0;
+  static uint16_t seconds_from_gps_data = 0;
+  // Local storage for conversion into seconds
+  static uint16_t hours_to_seconds = 0;
+  static uint16_t minutes_to_seconds = 0;
+  static uint16_t seconds_is_seconds = 0;
+  static uint16_t total_in_seconds = 0;
+  // Local storage for convertion back to HH:MM:SS
+  static uint16_t from_seconds_to_hours = 0;
+  static uint16_t from_seconds_to_minutes = 0;
+  static uint16_t converted_seconds = 0;
+
   while (serial_gps.available())
   {
     if (module_gps.encode(serial_gps.read()))
     {
-      if (module_gps.time.isValid())
+      if (module_gps.time.isValid() && module_gps.time.isUpdated())
       {
+        // Fetch time from GPS module
+        hours_from_gps_data = module_gps.time.hour();
+        minutes_from_gps_data = module_gps.time.minute();
+        seconds_from_gps_data = module_gps.time.second();
+        // Convert the time to seconds
+        hours_to_seconds = (hours_from_gps_data * 3600) + 28800; // 28800 seconds is GMT+8
+        minutes_to_seconds = minutes_from_gps_data * 60;
+        seconds_is_seconds = seconds_from_gps_data;
+        total_in_seconds = hours_to_seconds + minutes_to_seconds + seconds_is_seconds; // Added all the converted-seconds
+        // Convert again to HH:MM:SS (24-hour format)
+        from_seconds_to_hours = (total_in_seconds / 3600) % 24;
+        from_seconds_to_minutes = (total_in_seconds % 3600) / 60;
+        converted_seconds = total_in_seconds % 60;
+        // Convert to String
         char time_str[12];
         snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d",
-                 module_gps.time.hour(), module_gps.time.minute(), module_gps.time.second());
-        current_gps_time = String(time_str);
+                 from_seconds_to_hours, from_seconds_to_minutes, converted_seconds);
+        current_gps_time = String(time_str); // Update the time variable that will be sent to the server
       }
 
       if (module_gps.location.isValid())
@@ -335,27 +375,42 @@ void handle_gps_reading()
 
 void handle_rfid_reading()
 {
-  static String last_scanned_uid = ""; // Persistent storage for UID
-  static uint8_t last_valid_read = 0;  // Timer for debouncing
-  static bool is_on_travel = false;    // Track if someone is on a travel
-  static uint32_t start_time_exit = 0; // Start timer
-  static uint32_t end_time_entry = 0;  // End Timer
-  static uint32_t duration = 0;
-  static uint32_t seconds = 0, minutes = 0, hours = 0;
+  static bool exit_time_valid;                  // Flag for exit time validity
+  static bool entry_time_valid;                 // Flag for entry time validity
+  static bool is_on_travel = false;             // Track if someone is on a travel
+  static String last_scanned_uid = "";          // Persistent storage for UID
+  static uint16_t last_valid_read = 0;          // Timer for debouncing
+  static uint16_t start_time_to_exit_in_ms = 0; // Start timer
+  static uint16_t end_time_to_entry_in_ms = 0;  // End Timer
+  static uint16_t computed_duration_in_ms = 0;
+  static uint16_t seconds = 0, minutes = 0, hours = 0;
+  // Local storage for time
+  static uint16_t hours_from_gps_data = 0;
+  static uint16_t minutes_from_gps_data = 0;
+  static uint16_t seconds_from_gps_data = 0;
+  // Local storage for conversion into seconds
+  static uint16_t hours_to_seconds = 0;
+  static uint16_t minutes_to_seconds = 0;
+  static uint16_t seconds_is_seconds = 0;
+  static uint16_t total_in_seconds = 0;
+  // Local storage for convertion back to HH:MM:SS
+  static uint16_t from_seconds_to_hours = 0;
+  static uint16_t from_seconds_to_minutes = 0;
+  static uint16_t converted_seconds = 0;
 
   if (module_rfid.PICC_IsNewCardPresent() && module_rfid.PICC_ReadCardSerial())
   {
     digitalWrite(BUILTIN_LED_PIN, LOW); // Turn on LED (active LOW)
     digitalWrite(RFID_LED_PIN, HIGH);   // Turn on external LED
 
-    String scanned_uid = "";
+    String new_scanned_uid = "";
     for (byte i = 0; i < module_rfid.uid.size; i++)
     {
       if (module_rfid.uid.uidByte[i] < 0x10)
-        scanned_uid += "0";
-      scanned_uid += String(module_rfid.uid.uidByte[i], HEX);
+        new_scanned_uid += "0";
+      new_scanned_uid += String(module_rfid.uid.uidByte[i], HEX);
     }
-    scanned_uid.toUpperCase();
+    new_scanned_uid.toUpperCase();
 
     // Debouncing check - ignore rapid repeated scans
     if ((millis() - last_valid_read) < 2000)
@@ -370,28 +425,47 @@ void handle_rfid_reading()
     // First scan ever or after person returned (TIME OUT/EXIT)
     if ((last_scanned_uid == "") || !is_on_travel)
     {
-      last_scanned_uid = scanned_uid; // Sets the newly scanned UID as last scanned UID
-      current_rfid = scanned_uid;     // Sets the newly scanned UID as the current UID
-      last_valid_read = millis();
-      is_on_travel = true; // Person is now "out"
+      last_scanned_uid = new_scanned_uid; // Sets the newly scanned UID as last scanned UID
+      current_rfid = new_scanned_uid;     // Sets the newly scanned UID as the current UID
+      last_valid_read = millis();         // Timer for debouncing - prevent rapid reads
+      is_on_travel = true;                // Person is now "out"
+
+      Serial.println("Internal Timer started");
+      start_time_to_exit_in_ms = millis(); // Internal timer starts on the first scan ever or after 1 cycle completes
 
       // Record TIME OUT (now on a travel)
       if (module_gps.time.isValid() && module_gps.time.isUpdated())
       {
+        // Fetch time from GPS module
+        hours_from_gps_data = module_gps.time.hour();
+        minutes_from_gps_data = module_gps.time.minute();
+        seconds_from_gps_data = module_gps.time.second();
+        // Convert the time to seconds
+        hours_to_seconds = (hours_from_gps_data * 3600) + 28800; // 28800 seconds is GMT+8
+        minutes_to_seconds = minutes_from_gps_data * 60;
+        seconds_is_seconds = seconds_from_gps_data;
+        total_in_seconds = hours_to_seconds + minutes_to_seconds + seconds_is_seconds; // Adding all the converted-seconds
+        // Convert again to HH:MM:SS (24-hour format)
+        from_seconds_to_hours = (total_in_seconds / 3600) % 24;
+        from_seconds_to_minutes = (total_in_seconds % 3600) / 60;
+        converted_seconds = total_in_seconds % 60;
+        // Convert to String
         char time_str[12];
         snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d",
-                 module_gps.time.hour(), module_gps.time.minute(), module_gps.time.second());
+                 from_seconds_to_hours, from_seconds_to_minutes, converted_seconds);
         time_exit = String(time_str);
-        Serial.println("EXIT TIME @ " + time_exit + " - UID: " + scanned_uid);
+        Serial.println("EXIT TIME @ " + time_exit + " - UID: " + new_scanned_uid);
+
+        // Validity flag
+        exit_time_valid = true;
       }
       else
       {
-        Serial.println("Timer started");
-        end_time_entry = millis(); // Start timer
+        exit_time_valid = false;
       }
     }
     // Same card scanned while person is "out" (TIME IN/EXIT)
-    else if ((scanned_uid == last_scanned_uid) && is_on_travel)
+    else if ((new_scanned_uid == last_scanned_uid) && is_on_travel)
     {
       last_valid_read = millis();
       is_on_travel = false; // Person is now "in"
@@ -399,41 +473,81 @@ void handle_rfid_reading()
       // Record TIME IN
       if (module_gps.time.isValid() && module_gps.time.isUpdated())
       {
+        // Fetch time from GPS module
+        hours_from_gps_data = module_gps.time.hour();
+        minutes_from_gps_data = module_gps.time.minute();
+        seconds_from_gps_data = module_gps.time.second();
+        // Convert the time to seconds
+        hours_to_seconds = (hours_from_gps_data * 3600) + 28800; // 28800 seconds is GMT+8
+        minutes_to_seconds = minutes_from_gps_data * 60;
+        seconds_is_seconds = seconds_from_gps_data;
+        total_in_seconds = hours_to_seconds + minutes_to_seconds + seconds_is_seconds; // Adding all the converted-seconds
+        // Convert again to HH:MM:SS (24-hour format)
+        from_seconds_to_hours = (total_in_seconds / 3600) % 24;
+        from_seconds_to_minutes = (total_in_seconds % 3600) / 60;
+        converted_seconds = total_in_seconds % 60;
+        // Convert to String
         char time_str[12];
         snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d",
-                 module_gps.time.hour(), module_gps.time.minute(), module_gps.time.second());
+                 from_seconds_to_hours, from_seconds_to_minutes, converted_seconds);
         time_entry = String(time_str);
-        Serial.println("ENTRY TIME @ " + time_entry + " - UID: " + scanned_uid);
-      }
-      else
-      {
-        duration = (end_time_entry - start_time_exit);
-        hours = duration / 3600000;
-        minutes = (duration % 3600000) / 60000;
-        seconds = (duration % 60000) / 1000;
-        Serial.printf("Timer ended | Duration: %d:%d:%d\n",
-                      hours,
-                      minutes,
-                      seconds);
+        Serial.println("ENTRY TIME @ " + time_entry + " - UID: " + new_scanned_uid);
+
+        // Validity flag
+        entry_time_valid = true;
       }
     }
     // Different card scanned while authorized person is out
-    else if ((scanned_uid != last_scanned_uid) && is_on_travel)
+    else if ((new_scanned_uid != last_scanned_uid) && is_on_travel)
     {
-      Serial.println("UNAUTHORIZED - Wrong RFID Card/Tag. Expected: " + last_scanned_uid + ", Got: " + scanned_uid);
+      Serial.println("UNAUTHORIZED - Wrong RFID Card/Tag. Expected: " + last_scanned_uid + ", Got: " + new_scanned_uid);
       last_valid_read = millis();
       // Don't change the state - unauthorized access
-    }
-    // Different card scanned while no one is out (shouldn't happen with current logic)
-    else if ((scanned_uid != last_scanned_uid) && !is_on_travel)
-    {
-      Serial.println("UNAUTHORIZED - Wrong RFID Card/Tag. UID: " + scanned_uid);
-      last_valid_read = millis();
     }
 
     // Clean up RFID module
     module_rfid.PICC_HaltA();
     module_rfid.PCD_StopCrypto1();
+
+    // ---- Time validity conditions ----
+    if (exit_time_valid == false)
+    {
+      /*
+      Will handle back-counting if exit time is not valid or available
+      (e.g. no data coming from GPS module itself or skies are blocked) haven't figured out how
+      */
+      while (!module_gps.time.isValid() && !module_gps.time.isUpdated()) // Attempt to check time data
+      {
+        // Logic haven't figured how
+        // should i copy-paste the logic for time calculation just like in handle_gps_reading and set it as the "time_exit"
+      }
+
+      exit_time_valid = true; // Update the boolean flag if success
+    }
+
+    if (entry_time_valid == false)
+    {
+      /*
+      Will handle back-counting if entry time is not valid or available
+      (e.g. no data coming from GPS module itself or skies are blocked)
+
+      is block below correct? 
+      
+      end_time_to_entry_in_ms = millis();
+      computed_duration_in_ms = (end_time_to_entry_in_ms - start_time_to_exit_in_ms);
+      hours = (computed_duration_in_ms / 3600000);
+      minutes = (computed_duration_in_ms % 3600000) / 60000;
+      seconds = (computed_duration_in_ms % 60000) / 1000;
+      char final_duration_str[12];
+      snprintf(final_duration_str, sizeof(final_duration_str), "%02d:%02d:%02d",
+               hours,
+               minutes,
+               seconds);
+      duration = String(final_duration_str);
+      Serial.println("DURATION @ " + duration);
+      */
+     entry_time_valid = true;
+    }
 
     // LED Indicators
     delay(1000);
@@ -515,7 +629,7 @@ void handle_running_state()
     Serial.println("WiFi disconnected, returning to connection state");
     components.wifi_ok = false;
     components.http_ok = false;
-    current_state = STATE_WIFI_CONNECTING;
+    current_system_state = STATE_WIFI_CONNECTING;
     last_wifi_attempt = 0;
     state_timeout = millis() + 30000;
     return;
@@ -567,13 +681,13 @@ void setup()
   Serial.println("Device UUID: " + phys_addr_str);
 
   // Start with initialization state
-  current_state = STATE_INIT;
+  current_system_state = STATE_INIT;
 }
 
 void loop()
 {
   // State Machine Execution
-  switch (current_state)
+  switch (current_system_state)
   {
   case STATE_INIT:
     handle_init_state();
