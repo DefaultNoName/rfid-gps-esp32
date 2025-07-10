@@ -31,15 +31,15 @@ IPAddress dns(192, 168, 120, 1);       // DNS
 
 // GPS pins - Using SoftwareSerial library
 #define GPS_RX_PIN 16 // GPIO16 (connect to GPS TX)
-#define GPS_TX_PIN 5 // D1 - GPIO5 (connect to GPS RX)
+#define GPS_TX_PIN 17 // D1 - GPIO5 (connect to GPS RX)
 
 // HC-05 Bluetooth Module pins - Using SoftwareSerial
 #define BT_RX_PIN 10 // S3 - GPIO 10
 #define BT_TX_PIN 9  // S2 - GPIO 9
 
 // LED indicators
-#define BUILTIN_LED_PIN 2 // GPIO2 (onboard LED - active LOW on ESP8266)
-#define RFID_LED_PIN 16   // D0 - GPIO16 (external LED indicator)
+#define BUILTIN_LED_PIN 2 // GPIO2 (onboard LED - ESP32 also uses GPIO2)
+#define RFID_LED_PIN 4    // GPIO4 (external LED indicator)
 
 // System States for Pseudo-Multitasking
 enum system_state_t
@@ -144,7 +144,7 @@ void handle_init_state()
     }
 
     // Initialize serial communication for GPS @ 9600 baud
-    serial_gps.begin(9600);
+    serial_gps.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
     // Move to WiFi connection state
     current_system_state = STATE_WIFI_CONNECTING;
@@ -162,8 +162,8 @@ void handle_wifi_connecting()
     {
         Serial.println("Starting WiFi Connection...");
         WiFi.mode(WIFI_STA);
-        WiFi.setAutoReconnect(false); // We'll handle reconnection manually
-        WiFi.setSleepMode(WIFI_NONE_SLEEP);
+        WiFi.setAutoReconnect(false);
+        WiFi.setSleep(false);
         WiFi.config(sensor_ip, gateway, subnet, dns);
         WiFi.begin(ssid, password);
         wifi_started = true;
@@ -186,7 +186,7 @@ void handle_wifi_connecting()
             return;
         }
 
-        if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL || status == WL_WRONG_PASSWORD)
+        if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL)
         {
             Serial.printf("\nWiFi Connection Failed with Status: %d\n", status);
             components.last_error = "Can't connect to WiFi network, check WiFi config.";
@@ -775,9 +775,9 @@ void handle_running_state()
 
 void setup()
 {
-    Serial.begin(9600);
+    Serial.begin(115200);
     delay(1000);
-    system_update_cpu_freq(160); // 160MHz for ESP8266
+    setCpuFrequencyMhz(240); // 240MHz for ESP32
     delay(1000);
 
     // Initialize LED pins
