@@ -1,45 +1,15 @@
 // Proof-of-Concept Project - ESP32 Port
 
-#include <Arduino.h>
 #include <WiFi.h>
+#include <BluetoothSerial.h>
 #include <HTTPClient.h>
 #include <MFRC522v2.h>
 #include <MFRC522DriverSPI.h>
 #include <MFRC522DriverPinSimple.h>
 #include <HardwareSerial.h>
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEServer.h>
-#include <BLEClient.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
 #include <SPI.h>
 #include <TinyGPSPlus.h>
 #include <ArduinoJson.h>
-
-// Wi-Fi credentials
-const char *ssid = "ESP32-Server";       // Server SSID
-const char *password = "01234567890";    // Server Passphrase
-const char *server_ip = "192.168.120.1"; // Server IP
-const int server_port = 80;
-const char *upload_path = "/upload";
-IPAddress sensor_ip(192, 168, 120, 100); // Fixed IP for this mcu
-IPAddress gateway(192, 168, 120, 1);     // ESP32-AP gateway
-IPAddress subnet(255, 255, 255, 0);      // Subnet mask
-IPAddress dns(192, 168, 120, 1);         // DNS
-
-// RFID MFRC522 pins to ESP32
-#define SS_PIN 5   // GPIO5 (SS/CS pin for RFID)
-#define RST_PIN 22 // GPIO22 (RST pin for RFID)
-// Note: SPI pins are fixed on ESP8266: SCK=GPIO14(D5), MOSI=GPIO13(D7), MISO=GPIO12(D6)
-
-// GPS pins - Using HardwareSerial - UART2
-#define GPS_RX_PIN 16 // GPIO16 (connect to GPS TX)
-#define GPS_TX_PIN 17 // GPIO5 (connect to GPS RX)
-
-// LED indicators
-#define BUILTIN_LED_PIN 2 // GPIO2 (onboard LED - ESP32 also uses GPIO2)
-#define RFID_LED_PIN 4    // GPIO4 (external LED indicator)
 
 // System States for Pseudo-Multitasking
 enum system_state_t
@@ -47,11 +17,9 @@ enum system_state_t
     STATE_INIT,
     STATE_WIFI_CONNECTING,
     STATE_WIFI_CONNECTED,
-    STATE_WIFI_RECONNECTION,
     STATE_BLE_CONNECTING,
     STATE_BLE_CONNECTED,
-    STATE_BLE_RECONNECTION,
-    STATE_MODULE_INIT,
+    STATE_HARDWARE_INIT,
     STATE_RUNNING,
     STATE_ERROR
 };
@@ -77,6 +45,34 @@ struct timing_data_t
     String calculated_time;             // Final calculated time (GPS or estimated)
 };
 
+// NEW: Communication method enumeration
+enum CommunicationMethod
+{
+    COMM_WIFI,
+    COMM_BLE,
+    COMM_NONE
+};
+
+// NEW: Communication status structure
+struct CommunicationStatus
+{
+    bool wifi_available = false;
+    bool ble_available = false;
+    CommunicationMethod current_method = COMM_NONE;
+    CommunicationMethod preferred_method = COMM_WIFI;
+    unsigned long last_wifi_attempt = 0;
+    unsigned long last_ble_attempt = 0;
+    unsigned long last_successful_send = 0;
+    int consecutive_failures = 0;
+};
+
+// NEW: Data queue for offline storage
+struct SensorData
+{
+    String json_payload;
+    unsigned long timestamp;
+};
+
 // Global variables
 system_state_t current_system_state = STATE_INIT;
 component_status_t components;
@@ -89,6 +85,22 @@ timing_data_t entry_timing;
 unsigned long gps_became_available_at = 0; // When GPS first became valid
 bool gps_ever_available = false;
 
+// Communication status tracker
+CommunicationStatus commStatus;
+
+// RFID MFRC522 pins to ESP32
+#define SS_PIN 5   // GPIO5 (SS/CS pin for RFID)
+#define RST_PIN 22 // GPIO22 (RST pin for RFID)
+// Note: SPI pins are fixed on ESP8266: SCK=GPIO14(D5), MOSI=GPIO13(D7), MISO=GPIO12(D6)
+
+// GPS pins - Using HardwareSerial - UART2
+#define GPS_RX_PIN 16 // GPIO16 (connect to GPS TX)
+#define GPS_TX_PIN 17 // GPIO5 (connect to GPS RX)
+
+// LED indicators
+#define BUILTIN_LED_PIN 2 // GPIO2 (onboard LED - ESP32 also uses GPIO2)
+#define RFID_LED_PIN 4    // GPIO4 (external LED indicator)
+
 // Hardware variables - Fixed pin assignments
 MFRC522DriverPinSimple ss_pin(SS_PIN);
 MFRC522DriverSPI driver{ss_pin};
@@ -96,12 +108,21 @@ MFRC522 module_rfid{driver};
 TinyGPSPlus module_gps;
 HardwareSerial serial_gps(2);
 
-// Variables to track BLE connection
-BLEClient *pClient = nullptr;
-BLERemoteCharacteristic *pRemoteCharacteristic = nullptr;
-bool deviceConnected = false;
-bool doConnect = false;
-std::string deviceAddress = "";
+// Wi-Fi credentials
+const char *ssid = "ESP32-Server";       // Server SSID
+const char *password = "01234567890";    // Server Passphrase
+const char *server_ip = "192.168.120.1"; // Server IP
+const int server_port = 80;              // Server Port (HTTP)
+const char *upload_path = "/upload";
+IPAddress sensor_ip(192, 168, 120, 100); // Fixed IP for this mcu
+IPAddress gateway(192, 168, 120, 1);     // ESP32-AP gateway
+IPAddress subnet(255, 255, 255, 0);      // Subnet mask
+IPAddress dns(192, 168, 120, 1);         // DNS
+
+// BLE configuration
+const char *BLE_DEVICE_NAME = "ESP32-SENSOR-0001"; // This device BLE name
+const char *BLE_BRIDGE_NAME = "ESP-BLE";           // Name of bridge device
+BluetoothSerial SerialBT;
 
 // Timing variables
 unsigned long last_wifi_attempt = 0;
@@ -118,37 +139,44 @@ const char *vehicle_model = "Tamaraw FX";
 const char *vehicle_plate = "UAM981";
 
 // Data storage
-String current_rfid = "N/A";
-String time_exit = "N/A";
-String time_entry = "N/A";
-String trip_duration = "N/A";
-String current_gps_time = "N/A";
-String current_gps_lat = "N/A";
-String current_gps_lng = "N/A";
-String current_gps_alt = "N/A";
-String current_gps_speed = "N/A";
-String current_gps_sats = "N/A";
-String current_gps_hdop = "N/A";
+String current_rfid;
+String time_exit;
+String time_entry;
+String trip_duration;
+String current_gps_time;
+String current_gps_lat;
+String current_gps_lng;
+String current_gps_alt;
+String current_gps_speed;
+String current_gps_sats;
+String current_gps_hdop;
 
-// Fixed MAC address retrieval for ESP8266
+// Maximum number of readings to store offline
+const int MAX_QUEUE_SIZE = 50;
+SensorData dataQueue[MAX_QUEUE_SIZE];
+int queueHead = 0;
+int queueTail = 0;
+int queueSize = 0;
+
+// MAC address retrieval
 String get_phys_addr()
 {
     String mac = WiFi.macAddress();
     mac.replace(":", ""); // Remove colons to match format
     return mac;
 }
-String phys_addr_str = "";       // Will be set in setup()
-const char *phys_addr = nullptr; // Will be set in setup()
+String phys_addr_str = "";
+const char *phys_addr = nullptr;
 
 // State machine functions
 void handle_init_state()
 {
-    Serial.println("=== System Initialization ===");
-    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+    //Serial.println("=== System Initialization ===");
+    //Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
 
     if (ESP.getFreeHeap() < 30000)
     {
-        Serial.println("Insufficient memory available, restarting...");
+        //Serial.println("Insufficient memory available, restarting...");
         delay(1000);
         ESP.restart();
     }
@@ -160,7 +188,7 @@ void handle_init_state()
     current_system_state = STATE_WIFI_CONNECTING;
     last_wifi_attempt = millis();
     state_timeout = millis() + 30000; // 30 second timeout
-    Serial.println("Moving to WiFi connection state");
+    //Serial.println("Moving to WiFi connection state");
 }
 
 void handle_wifi_connecting()
@@ -170,14 +198,14 @@ void handle_wifi_connecting()
 
     if (!wifi_started)
     {
-        Serial.println("Starting WiFi Connection...");
+        // Serial.println("Starting WiFi Connection...");
         WiFi.mode(WIFI_STA);
         WiFi.setAutoReconnect(false);
         WiFi.setSleep(false);
         WiFi.config(sensor_ip, gateway, subnet, dns);
         WiFi.begin(ssid, password);
         wifi_started = true;
-        Serial.print("Connecting");
+        // Serial.print("Connecting");
         return;
     }
 
@@ -188,9 +216,8 @@ void handle_wifi_connecting()
 
         if (status == WL_CONNECTED)
         {
-            Serial.println();
-            Serial.printf("WiFi Connected! IP: %s, Signal: %d dBm\n",
-                          WiFi.localIP().toString().c_str(), WiFi.RSSI());
+            // Serial.println();
+            // Serial.printf("WiFi Connected! IP: %s, Signal: %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
             components.wifi_ok = true;
             current_system_state = STATE_WIFI_CONNECTED;
             return;
@@ -198,20 +225,20 @@ void handle_wifi_connecting()
 
         if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL)
         {
-            Serial.printf("\nWiFi Connection Failed with Status: %d\n", status);
+            // Serial.printf("\nWiFi Connection Failed with Status: %d\n", status);
             components.last_error = "Can't connect to WiFi network, check WiFi config.";
             current_system_state = STATE_ERROR;
             return;
         }
 
-        Serial.print(".");
+        // Serial.print(".");
         last_wifi_attempt = millis();
         wifi_attempts++;
 
         // Timeout check
         if (millis() > state_timeout)
         {
-            Serial.println("\nWiFi connection timeout");
+            // Serial.println("\nWiFi connection timeout");
             components.last_error = "WiFi connection timeout.";
             current_system_state = STATE_ERROR;
             return;
@@ -221,122 +248,192 @@ void handle_wifi_connecting()
 
 void handle_wifi_connected()
 {
-    Serial.println("Initializing hardware...");
-    current_system_state = STATE_MODULE_INIT;
+    //  Serial.println("Initializing hardware...");
+    current_system_state = STATE_HARDWARE_INIT;
     state_timeout = millis() + 10000; // 10 second timeout for hardware initialize
 }
 
-// This callback gets triggered when we find BLE devices during scanning
-class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
+// BLE connection handling
+void handle_ble_connection()
 {
-    void onResult(BLEAdvertisedDevice advertisedDevice)
-    {
-        Serial.print("Found device: ");
-        Serial.println(advertisedDevice.toString().c_str());
+    static unsigned long lastBLEAttempt = 0;
 
-        // Look for your JDY-16 module by name
-        if (advertisedDevice.getName() == "VehicleTracker")
+    if (millis() - lastBLEAttempt > 10000)
+    { // Try every 10 seconds
+        if (!SerialBT.connected())
         {
-            Serial.println("Found our target device!");
-            deviceAddress = advertisedDevice.getAddress().toString();
-            doConnect = true;
-            advertisedDevice.getScan()->stop(); // Stop scanning once we find our device
+            // Serial.println("Attempting BLE connection...");
+            if (SerialBT.connect(BLE_BRIDGE_NAME))
+            {
+                //     Serial.println("BLE connected successfully");
+                commStatus.ble_available = true;
+                commStatus.last_ble_attempt = millis();
+            }
+            else
+            {
+                //      Serial.println("BLE connection failed");
+                commStatus.ble_available = false;
+            }
         }
+        lastBLEAttempt = millis();
     }
-};
-
-// Callback for when we successfully connect
-class MyClientCallback : public BLEClientCallbacks
-{
-    void onConnect(BLEClient *pclient)
-    {
-        Serial.println("Connected to JDY-16 module");
-        deviceConnected = true;
-    }
-
-    void onDisconnect(BLEClient *pclient)
-    {
-        Serial.println("Disconnected from JDY-16 module");
-        deviceConnected = false;
-    }
-};
-
+}
+// BLE connection state handler
 void handle_ble_connecting()
 {
-    // Initialize BLE
-    BLEDevice::init("Tracker-ESP32#1");
+    static unsigned long bleStartTime = 0;
 
-    // Start scanning for devices
-    BLEScan *pBLEScan = BLEDevice::getScan();
-    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-    pBLEScan->setInterval(1349);   // Scan interval in milliseconds
-    pBLEScan->setWindow(449);      // Scan window in milliseconds
-    pBLEScan->setActiveScan(true); // Active scanning uses more power but gets more info
-    pBLEScan->start(30, false);    // Scan for 30 seconds
+    if (bleStartTime == 0)
+    {
+        // Serial.println("Starting BLE connection...");
+        SerialBT.begin(BLE_DEVICE_NAME);
+        bleStartTime = millis();
+    }
+
+    // Check if BLE is ready and try to connect
+    if (millis() - bleStartTime > 2000)
+    { // Wait 2 seconds for BLE to initialize
+        handle_ble_connection();
+
+        if (SerialBT.connected())
+        {
+            //  Serial.println("BLE connected, moving to running state");
+            current_system_state = STATE_RUNNING;
+        }
+        else if (millis() - bleStartTime > 30000)
+        { // 30 second timeout
+          //  Serial.println("BLE connection timeout");
+            current_system_state = STATE_ERROR;
+        }
+    }
 }
 
-bool connect_to_bridge_esp()
+// Communication method selection logic
+void select_communication_method()
 {
-    Serial.print("Attempting to connect to ");
-    Serial.println(deviceAddress.c_str());
-
-    pClient = BLEDevice::createClient();
-    pClient->setClientCallbacks(new MyClientCallback());
-
-    // Connect to the BLE device
-    pClient->connect(BLEAddress(deviceAddress));
-    Serial.println(" - Connected to server");
-
-    // Obtain a reference to the service we are after (UART service)
-    BLERemoteService *pRemoteService = pClient->getService("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
-    if (pRemoteService == nullptr)
+    // Check WiFi availability
+    if (WiFi.status() == WL_CONNECTED)
     {
-        Serial.print("Failed to find UART service UUID");
-        pClient->disconnect();
-        return false;
-    }
-    Serial.println(" - Found UART service");
-
-    // Get the characteristic used for sending data
-    pRemoteCharacteristic = pRemoteService->getCharacteristic("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
-    if (pRemoteCharacteristic == nullptr)
-    {
-        Serial.print("Failed to find TX characteristic UUID");
-        pClient->disconnect();
-        return false;
-    }
-    Serial.println(" - Found TX characteristic");
-
-    // Set up notifications for receiving data
-    BLERemoteCharacteristic *pRxCharacteristic = pRemoteService->getCharacteristic("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
-    if (pRxCharacteristic != nullptr)
-    {
-        pRxCharacteristic->registerForNotify([](BLERemoteCharacteristic *pBLERemoteCharacteristic, uint8_t *pData, size_t length, bool isNotify)
-                                             {
-            // This callback is triggered when we receive data from the JDY-16
-            Serial.print("Received data: ");
-            for (int i = 0; i < length; i++) {
-                Serial.print((char)pData[i]);
-            }
-            Serial.println(); });
-    }
-
-    return true;
-}
-
-void sendJsonData(String jsonData)
-{
-    if (deviceConnected && pRemoteCharacteristic != nullptr)
-    {
-        // BLE can handle the fragmentation automatically
-        pRemoteCharacteristic->writeValue(jsonData.c_str(), jsonData.length());
-        Serial.println("JSON data sent via BLE");
+        commStatus.wifi_available = true;
+        if (commStatus.current_method != COMM_WIFI)
+        {
+            // Serial.println("Switching to WiFi communication");
+            commStatus.current_method = COMM_WIFI;
+            commStatus.consecutive_failures = 0;
+        }
+        return;
     }
     else
     {
-        Serial.println("Not connected - cannot send data");
+        commStatus.wifi_available = false;
     }
-};
+
+    // Check BLE availability
+    if (SerialBT.connected())
+    {
+        commStatus.ble_available = true;
+        if (commStatus.current_method != COMM_BLE)
+        {
+            // Serial.println("Switching to BLE communication");
+            commStatus.current_method = COMM_BLE;
+            commStatus.consecutive_failures = 0;
+        }
+        return;
+    }
+    else
+    {
+        commStatus.ble_available = false;
+    }
+
+    // No communication available
+    if (commStatus.current_method != COMM_NONE)
+    {
+        // Serial.println("No communication method available");
+        commStatus.current_method = COMM_NONE;
+    }
+}
+
+// Switch to alternate communication method
+void switch_alternate_communication()
+{
+    if (commStatus.current_method == COMM_WIFI)
+    {
+        // Serial.println("WiFi failing, attempting BLE...");
+        if (!SerialBT.begin(BLE_DEVICE_NAME))
+        {
+            // Serial.println("BLE initialization failed");
+            return;
+        }
+        current_system_state = STATE_BLE_CONNECTING;
+    }
+    else if (commStatus.current_method == COMM_BLE)
+    {
+        // Serial.println("BLE failing, attempting WiFi...");
+        current_system_state = STATE_WIFI_CONNECTING;
+        last_wifi_attempt = 0;
+    }
+
+    commStatus.consecutive_failures = 0;
+}
+
+// WiFi transmission
+bool sendDataViaWiFi(const String &jsonData)
+{
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        return false;
+    }
+
+    String url = String("http://") + server_ip + ":" + String(server_port) + upload_path;
+
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(5000);
+
+    int httpResponseCode = http.POST(jsonData);
+    bool success = (httpResponseCode == 200);
+
+    if (!success)
+    {
+        // Serial.printf("HTTP Error: %d\n", httpResponseCode);
+    }
+
+    http.end();
+    return success;
+}
+
+//  BLE data transmission
+bool sendDataViaBLE(const String &jsonData)
+{
+    if (!SerialBT.connected())
+    {
+        return false;
+    }
+
+    // Send JSON data with delimiter
+    SerialBT.println("START_JSON");
+    SerialBT.println(jsonData);
+    SerialBT.println("END_JSON");
+
+    // Wait for acknowledgment (optional)
+    unsigned long startTime = millis();
+    while (millis() - startTime < 2000)
+    { // 2 second timeout
+        if (SerialBT.available())
+        {
+            String response = SerialBT.readStringUntil('\n');
+            if (response.indexOf("ACK") >= 0)
+            {
+                // Serial.println("BLE transmission acknowledged");
+                return true;
+            }
+        }
+        delay(50);
+    }
+
+    // Serial.println("BLE transmission timeout");
+    return false;
+}
 
 void handle_hardware_init()
 {
@@ -478,20 +575,20 @@ void handle_gps_reading()
                 // Check time if valid
                 if (!module_gps.time.isValid())
                 {
-                    Serial.println("Time not valid");
+                    // Serial.println("Time not valid");
                     lastGPSUpdate = currentTime;
                 }
                 else
                 {
                     // Update time
                     current_gps_time = format_gps_time_to_local(module_gps.time);
-                    Serial.println("Current time: " + current_gps_time);
+                    // Serial.println("Current time: " + current_gps_time);
                 }
 
                 // Check location if valid
                 if (!module_gps.location.isValid())
                 {
-                    Serial.println("Location not valid");
+                    // Serial.println("Location not valid");
                     lastGPSUpdate = currentTime;
                 }
                 else
@@ -499,8 +596,8 @@ void handle_gps_reading()
                     // Update location
                     current_gps_lat = String(module_gps.location.lat(), 8);
                     current_gps_lng = String(module_gps.location.lng(), 8);
-                    Serial.println("Lat: " + current_gps_lat);
-                    Serial.println("Long: " + current_gps_lng);
+                    // Serial.println("Lat: " + current_gps_lat);
+                    // Serial.println("Long: " + current_gps_lng);
                 }
 
                 // Update other GPS data
@@ -550,7 +647,7 @@ timing_data_t capture_current_time()
         {
             gps_became_available_at = timing.millis_timestamp;
             gps_ever_available = true;
-            Serial.println("GPS became available at millis: " + String(gps_became_available_at));
+            // Serial.println("GPS became available at millis: " + String(gps_became_available_at));
         }
 
         timing.gps_reference_millis = gps_became_available_at;
@@ -632,7 +729,7 @@ void update_pending_timestamps()
             exit_timing.millis_timestamp,
             gps_became_available_at,
             current_gps_time);
-        Serial.println("Updated exit time: " + exit_timing.calculated_time);
+        // Serial.println("Updated exit time: " + exit_timing.calculated_time);
     }
 
     // Update entry time if it was pending
@@ -642,7 +739,7 @@ void update_pending_timestamps()
             entry_timing.millis_timestamp,
             gps_became_available_at,
             current_gps_time);
-        Serial.println("Updated entry time: " + entry_timing.calculated_time);
+        // Serial.println("Updated entry time: " + entry_timing.calculated_time);
     }
 }
 
@@ -655,22 +752,22 @@ void handle_exit_scan(const String &new_scanned_uid, String &last_new_scanned_ui
     last_valid_read = millis();
     is_on_travel = true;
 
-    Serial.println("Internal millis() Timer started");
+    // Serial.println("Internal millis() Timer started");
     start_time_millis = millis();
 
     // Capture exit timing with GPS fallback
     exit_timing = capture_current_time();
     time_exit = exit_timing.calculated_time;
 
-    Serial.println("EXIT TIME @ " + time_exit + " - UID: " + new_scanned_uid);
+    // Serial.println("EXIT TIME @ " + time_exit + " - UID: " + new_scanned_uid);
 
     if (exit_timing.gps_time_valid)
     {
-        Serial.println("Exit time captured with GPS");
+        // Serial.println("Exit time captured with GPS");
     }
     else
     {
-        Serial.println("Exit time pending GPS availability");
+        // Serial.println("Exit time pending GPS availability");
     }
 }
 
@@ -686,15 +783,15 @@ void handle_entry_scan(const String &new_scanned_uid, String &last_new_scanned_u
     entry_timing = capture_current_time();
     time_entry = entry_timing.calculated_time;
 
-    Serial.println("ENTRY TIME @ " + time_entry + " - UID: " + new_scanned_uid);
+    // Serial.println("ENTRY TIME @ " + time_entry + " - UID: " + new_scanned_uid);
 
     if (entry_timing.gps_time_valid)
     {
-        Serial.println("Entry time captured with GPS");
+        // Serial.println("Entry time captured with GPS");
     }
     else
     {
-        Serial.println("Entry time pending GPS availability");
+        // Serial.println("Entry time pending GPS availability");
     }
 
     // Calculate duration using millis timestamps for accuracy
@@ -712,7 +809,7 @@ void cleanup_rfid()
     digitalWrite(RFID_LED_PIN, LOW);     // Turn off external LED
 }
 
-// Enhanced RFID reading function
+// RFID reading function
 void handle_rfid_reading()
 {
     static String last_new_scanned_uid = "";
@@ -784,12 +881,80 @@ void handle_rfid_reading()
     else if (new_scanned_uid != last_new_scanned_uid && is_on_travel)
     {
         // Different card while authorized person is out - UNAUTHORIZED
-        Serial.println("UNAUTHORIZED - Wrong RFID Card. Expected: " +
-                       last_new_scanned_uid + ", Got: " + new_scanned_uid);
+        // Serial.println("UNAUTHORIZED - Wrong RFID Card. Expected: " + last_new_scanned_uid + ", Got: " + new_scanned_uid);
         last_valid_read = millis();
     }
 
     cleanup_rfid();
+}
+
+// Data queue management functions
+void enqueueData(const String &jsonData)
+{
+    if (queueSize >= MAX_QUEUE_SIZE)
+    {
+        // Remove oldest data if queue is full
+        queueHead = (queueHead + 1) % MAX_QUEUE_SIZE;
+        queueSize--;
+    }
+
+    dataQueue[queueTail].json_payload = jsonData;
+    dataQueue[queueTail].timestamp = millis();
+    queueTail = (queueTail + 1) % MAX_QUEUE_SIZE;
+    queueSize++;
+
+    // Serial.printf("Data queued. Queue size: %d\n", queueSize);
+}
+
+bool dequeueData(String &jsonData)
+{
+    if (queueSize == 0)
+    {
+        return false;
+    }
+
+    jsonData = dataQueue[queueHead].json_payload;
+    queueHead = (queueHead + 1) % MAX_QUEUE_SIZE;
+    queueSize--;
+
+    return true;
+}
+
+void sendQueuedData()
+{
+    String queuedData;
+    int sentCount = 0;
+
+    while (dequeueData(queuedData) && sentCount < 5)
+    { // Limit to 5 per cycle
+        bool success = false;
+
+        switch (commStatus.current_method)
+        {
+        case COMM_WIFI:
+            success = sendDataViaWiFi(queuedData);
+            break;
+        case COMM_BLE:
+            success = sendDataViaBLE(queuedData);
+            break;
+        default:
+            // Re-queue if no communication
+            enqueueData(queuedData);
+            return;
+        }
+
+        if (success)
+        {
+            sentCount++;
+            // Serial.printf("Queued data sent. Remaining: %d\n", queueSize);
+        }
+        else
+        {
+            // Re-queue failed data at front
+            enqueueData(queuedData);
+            break;
+        }
+    }
 }
 
 void handle_http_transmission()
@@ -814,27 +979,50 @@ void handle_http_transmission()
     String json;
     serializeJson(doc, json);
 
-    String url = String("http://") + server_ip + ":" + String(server_port) + upload_path;
+    // Select communication method
+    select_communication_method();
 
-    http.begin(client, url);
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(15000);
+    bool transmissionSuccess = false;
 
-    int http_response_code = http.POST(json);
-    if (http_response_code == 200)
+    // Attempt transmission based on available method
+    switch (commStatus.current_method)
     {
-        // Success - no need to log every successful transmission
+    case COMM_WIFI:
+        transmissionSuccess = sendDataViaWiFi(json);
+        break;
+
+    case COMM_BLE:
+        transmissionSuccess = sendDataViaBLE(json);
+        break;
+
+    case COMM_NONE:
+        // Serial.println("No communication available, queuing data");
+        enqueueData(json);
+        return;
     }
-    else if (http_response_code > 0)
+
+    if (transmissionSuccess)
     {
-        Serial.printf("HTTP Error %d\n", http_response_code);
+        commStatus.last_successful_send = millis();
+        commStatus.consecutive_failures = 0;
+
+        // Send any queued data
+        sendQueuedData();
     }
     else
     {
-        Serial.printf("HTTP Connection Error: %d\n", http_response_code);
-    }
+        commStatus.consecutive_failures++;
+        // Serial.printf("Transmission failed. Failures: %d\n", commStatus.consecutive_failures);
 
-    http.end();
+        // Queue current data for retry
+        enqueueData(json);
+
+        // Switch communication method if too many failures
+        if (commStatus.consecutive_failures >= 3)
+        {
+            switch_alternate_communication();
+        }
+    }
 }
 
 void handle_health_check()
@@ -851,7 +1039,7 @@ void handle_health_check()
     // ESP8266 memory check - lower threshold
     if (ESP.getFreeHeap() < 50000)
     {
-        Serial.println("WARNING: Low memory, restarting system");
+        // Serial.println("WARNING: Low memory, restarting system");
         delay(1000);
         ESP.restart();
     }
@@ -859,62 +1047,71 @@ void handle_health_check()
 
 void handle_running_state()
 {
-    unsigned long current_time = millis();
+    unsigned long currentTime = millis();
 
-    // Check WiFi status
-    if (WiFi.status() != WL_CONNECTED || WiFi.status() == WL_DISCONNECTED || WiFi.status() == WL_CONNECTION_LOST || WiFi.status() == WL_CONNECT_FAILED)
+    // Manage communication connections
+    select_communication_method();
+
+    // Try to establish connections if none available
+    if (commStatus.current_method == COMM_NONE)
     {
-        Serial.println("WiFi disconnected, returning to connection state");
-        components.wifi_ok = false;
-        components.http_ok = false;
-        current_system_state = STATE_WIFI_CONNECTING;
-        last_wifi_attempt = 0;
-        state_timeout = millis() + 30000;
-        return;
+        // Try WiFi first (preferred)
+        if (currentTime - commStatus.last_wifi_attempt > 30000)
+        {
+            // Serial.println("Attempting WiFi reconnection...");
+            WiFi.reconnect();
+            commStatus.last_wifi_attempt = currentTime;
+        }
+
+        // Try BLE if WiFi attempts are failing
+        if (currentTime - commStatus.last_ble_attempt > 15000)
+        {
+            handle_ble_connection();
+            commStatus.last_ble_attempt = currentTime;
+        }
     }
 
     // Handle RFID reading
-    if (components.rfid_ok && current_time - last_rfid_read > 100)
+    if (components.rfid_ok && currentTime - last_rfid_read > 100)
     {
         handle_rfid_reading();
-        last_rfid_read = current_time;
+        last_rfid_read = currentTime;
     }
 
     // Handle GPS reading
-    if (components.gps_ok && current_time - last_gps_update > 500)
+    if (components.gps_ok && currentTime - last_gps_update > 1000)
     {
         handle_gps_reading();
-        last_gps_update = current_time;
+        last_gps_update = currentTime;
     }
 
-    // Handle HTTP transmission
-    if (components.http_ok && current_time - last_http_send > 5000)
+    // Handle data transmission with fallback
+    if (currentTime - last_http_send > 5000)
     {
         handle_http_transmission();
-        last_http_send = current_time;
+        last_http_send = currentTime;
     }
 
-    // Health check
-    if (current_time - last_health_check > 15000)
+    // Enhanced health check
+    if (currentTime - last_health_check > 15000)
     {
         handle_health_check();
-        last_health_check = current_time;
+        last_health_check = currentTime;
     }
 }
 
 void handle_error_state()
 {
-    Serial.printf("System Error: %s\n", components.last_error.c_str());
-    Serial.println("Will restart in 5 seconds...");
+    // Serial.printf("System Error: %s\n", components.last_error.c_str());
+    // Serial.println("Will restart in 5 seconds...");
     delay(5000);
     ESP.restart();
 }
 
 void setup()
 {
+    setCpuFrequencyMhz(240);
     Serial.begin(115200);
-    delay(1000);
-    setCpuFrequencyMhz(240); // 240MHz for ESP32
     delay(1000);
 
     // Initialize LED pins
@@ -923,15 +1120,17 @@ void setup()
     digitalWrite(BUILTIN_LED_PIN, HIGH); // Turn off builtin LED (active LOW)
     digitalWrite(RFID_LED_PIN, LOW);     // Turn off external LED
 
-    // Ensure WiFi is started before getting MAC address
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
-    delay(100); // Give WiFi stack time to initialize
-    phys_addr_str = get_phys_addr();
-    phys_addr = phys_addr_str.c_str(); // ESP8266's MAC Address
+    Serial.println(phys_addr_str);
 
-    Serial.println("=== Tracking System ===");
-    Serial.println("Device UUID: " + phys_addr_str);
+    // Initialize BLE
+    if (!SerialBT.begin(BLE_DEVICE_NAME))
+    {
+        // Serial.println("BLE initialization failed");
+    }
+    else
+    {
+        // Serial.println("BLE initialized");
+    }
 
     // Start with initialization state
     current_system_state = STATE_INIT;
@@ -951,10 +1150,14 @@ void loop()
     case STATE_WIFI_CONNECTED:
         handle_wifi_connected();
         break;
-    case STATE_BLE_CONNECTING:
+    case STATE_BLE_CONNECTING: // NEW state
         handle_ble_connecting();
         break;
-    case STATE_MODULE_INIT:
+    case STATE_BLE_CONNECTED: // NEW state
+        // Serial.println("BLE connected, initializing hardware...");
+        current_system_state = STATE_HARDWARE_INIT;
+        break;
+    case STATE_HARDWARE_INIT:
         handle_hardware_init();
         break;
     case STATE_RUNNING:
@@ -964,6 +1167,7 @@ void loop()
         handle_error_state();
         break;
     }
+
     // Small delay to prevent watchdog issues
     delay(10);
 }
